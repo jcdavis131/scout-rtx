@@ -133,6 +133,20 @@ while ($true) {
 
     Write-Host "Logged to results.tsv + $queueDir/results.jsonl" -ForegroundColor Green
 
+    # --- AUTO PUBLISH to GitHub Releases every 5 exps + scout sync ---
+    if ($expCount % 5 -eq 0) {
+        try {
+            $relTag = "v0.6.0-" + (Split-Path $Program -Leaf).Replace("program-","").Replace(".md","") + "-" + (Get-Date -Format "MMdd-HHmm")
+            Write-Host "Auto-publishing release $relTag (every 5 exps)..." -ForegroundColor Magenta
+            & "$PSScriptRoot/publish-release.ps1" -Program $Program -Tag $relTag -ErrorAction Continue
+            Write-Host "Dashboard will auto-read in <60s: https://github.com/jcdavis131/scout-rtx/releases/tag/$relTag" -ForegroundColor Cyan
+            # Also try scout CLI sync if available (Hatch path)
+            try { scout rtx releases sync --tag $relTag --json 2>$null | Out-Null } catch {}
+        } catch {
+            Write-Host "Auto-publish failed (will retry next 5): $_" -ForegroundColor Yellow
+        }
+    }
+
     # If MaxExperiments, break
     if ($MaxExperiments -gt 0 -and $expCount -ge $MaxExperiments) { break }
 
@@ -160,3 +174,15 @@ while ($true) {
 
 Write-Host "`n=== Autonomous loop finished after $expCount experiments ===" -ForegroundColor Cyan
 Write-Host "Review results.tsv, then sync to Hatch via .\scripts\sync-to-hatch.ps1"
+
+# Final publish — best-of run -> GitHub release -> dashboard auto-read in 60s
+try {
+    $finalTag = "v0.6.0-" + (Split-Path $Program -Leaf).Replace("program-","").Replace(".md","") + "-" + (Get-Date -Format "MMdd")
+    Write-Host "Final publish $finalTag -> scout-rtx releases..." -ForegroundColor Green
+    & "$PSScriptRoot/publish-release.ps1" -Program $Program -Tag $finalTag -ErrorAction Continue
+    Write-Host "Done. Verify: scout rtx releases list | scout rtx releases sync --tag $finalTag" -ForegroundColor Cyan
+    Write-Host "Dashboard: rtx-offload-dashboard auto-reads every 60s + hourly server cron rtx-releases-hourly-sync" -ForegroundColor Cyan
+} catch {
+    Write-Host "Final publish failed: $_ . Run manually: .\scripts\publish-release.ps1 -Program $Program" -ForegroundColor Yellow
+}
+
