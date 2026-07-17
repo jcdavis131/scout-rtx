@@ -59,6 +59,31 @@ After kept run, also:
 - Append to `bb-offload/results/ava-mapping.jsonl`
 - If possible, run `uv run eval_frontier_rubric.py --mock` via your Ava Docker and capture score — log to results.
 
+## Promotion gate — rank invariance (MAI-Thinking-1 finding, 2026-07-17)
+
+Small-scale winners can *invert* at scale (a 5B-vs-23B data-mix ablation flipped completely —
+see `ava-agi-factory-v6-4/docs/RL_INTEGRATION.md`). A single 5-min TinyStories win is a lead,
+not a promotion. Before flagging a commit as cherry-pick-worthy for `model_1b.py`:
+
+1. **Two-rung ladder, not one point.** Re-run the kept config at a second scale on the same
+   budget axis — e.g. depth 6 → depth 12, or width ×2 — keeping the token:param ratio fixed.
+   Win must hold at both rungs.
+2. **Log EG, not just val_bpb.** Use the factory's `efficiency_gain.py` against your own
+   baseline runs (`--x-key seconds --y-key val_bpb` for EG_Time on this box):
+   `python ~/workspace/ava-agi-factory-v6-4/efficiency_gain.py --baseline base.jsonl --candidate cand.jsonl --x-key seconds --y-key val_bpb`
+   Its `trend.verdict` (`promote`/`hold`) is the gate — both rungs > 1 and the bigger rung
+   not the worst.
+3. **Extend `ava-mapping.jsonl`** with the ladder evidence:
+```
+{"commit":"a1b2c3d","val_bpb":0.9932,"val_bpb_rung2":0.9914,"eg_time":[1.18,1.22],"eg_verdict":"promote","ava_idea":"Router entropy gating","ava_expected_gain":"S1/S2 better"}
+```
+   Note the rung order: `eg_trend` only returns `promote` when **every** rung EG > 1 **and the
+   larger rung is not the worst** (EG holds or rises with scale). A declining pair like
+   `[1.22, 1.18]` returns `hold` — a small-scale win that fades is exactly what the gate rejects.
+4. An `eg_verdict: hold` result is still worth logging (negative results steer the next tick) —
+   it just doesn't get the cherry-pick flag.
+
 ## Never stop — autonomous overnight researcher for Ava.
 
 Your human wakes up to log + promising commits to cherry-pick into `~/workspace/ava-agi-factory-v6-4/`.
+Only `eg_verdict: promote` entries are cherry-pick candidates.
