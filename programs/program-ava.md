@@ -75,8 +75,11 @@ not a promotion. Before flagging a commit as cherry-pick-worthy for `model_1b.py
    not the worst.
 3. **Extend `ava-mapping.jsonl`** with the ladder evidence:
 ```
-{"commit":"a1b2c3d","val_bpb":0.9932,"val_bpb_rung2":0.9914,"eg_time":[1.22,1.18],"eg_verdict":"promote","ava_idea":"Router entropy gating","ava_expected_gain":"S1/S2 better"}
+{"commit":"a1b2c3d","val_bpb":0.9932,"val_bpb_rung2":0.9914,"eg_time":[1.18,1.22],"eg_verdict":"promote","ava_idea":"Router entropy gating","ava_expected_gain":"S1/S2 better"}
 ```
+   Note the rung order: `eg_trend` only returns `promote` when **every** rung EG > 1 **and the
+   larger rung is not the worst** (EG holds or rises with scale). A declining pair like
+   `[1.22, 1.18]` returns `hold` — a small-scale win that fades is exactly what the gate rejects.
 4. An `eg_verdict: hold` result is still worth logging (negative results steer the next tick) —
    it just doesn't get the cherry-pick flag.
 
