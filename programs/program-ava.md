@@ -83,6 +83,41 @@ not a promotion. Before flagging a commit as cherry-pick-worthy for `model_1b.py
 4. An `eg_verdict: hold` result is still worth logging (negative results steer the next tick) —
    it just doesn't get the cherry-pick flag.
 
+## GPU handoff — what this box unblocks now (2026-07-17, CPU-pilot milestone)
+
+The factory's RL/CodeAct chain is **code-complete and mechanically proven**: the nano CPU pilot
+ran the real pipeline end-to-end in a cloud container (corpus → BPE tokenizer 8192 → packed
+shards → 90-step pretrain, lm 9.08→3.09 → real `--branch agentic` fork, lm 2.88→2.30) and one
+real GRPO update executed on the real branch checkpoint (evidence:
+`ava-agi-factory-v6-4/runs/cpu_pilot/MANIFEST.json`, scale=smoke_cpu_pilot,
+capability_claim=none). **Every remaining gate is GPU wall-clock — this machine's job.**
+The offload path is Docker: the repo's `ava-train` compose service (runtime: nvidia, repo
+mounted at `/workspace`) runs the *same scripts* the pilot proved, just bigger:
+
+```bash
+cd ~/workspace/ava-agi-factory-v6-4 && git pull
+docker compose up -d ava-train
+
+# 1. Capability-scale chain (T9.3/T9.5 proper): same pipeline, mini preset, CUDA.
+docker compose exec ava-train python scripts/cpu_pilot_e2e.py \
+  --preset mini --device cuda --steps 5000 --branch-steps 1500 \
+  --corpus-mb 200 --out runs/mini_pilot --train-timeout-s 86400
+
+# 2. Real GRPO updates on the resulting branch checkpoint (loop it — this is the climb):
+docker compose exec ava-train python scripts/rl_smoke_update.py \
+  --device cuda --run-dir runs/mini_pilot --preset mini \
+  --prompts 16 --group-size 8 --save-updated
+
+# 3. Score capability honestly: evals/codeact_eval.py run_codeact_eval with the trained
+#    checkpoint; two rungs (nano, mini) feed ava/rl/codeact_eg_gate.py for the promote/hold
+#    verdict — the EG gate above applies unchanged.
+```
+
+Notes: `--steps`/`--corpus-mb` above are starting points, not tuned values — measure s/step
+first and budget overnight runs accordingly. Everything the scripts print is measured; keep the
+manifests (they are the evidence chain). Seeded decodes are bit-identical across cpu/cuda by
+construction, so cloud-side plumbing tests remain valid for GPU runs.
+
 ## Never stop — autonomous overnight researcher for Ava.
 
 Your human wakes up to log + promising commits to cherry-pick into `~/workspace/ava-agi-factory-v6-4/`.

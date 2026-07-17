@@ -1,6 +1,6 @@
 [project]
 name = "autoresearch-rtx-custom"
-version = "0.5.0"
+version = "0.6.0"
 description = "Davis Custom: Alienware RTX 4080/4090 autonomous researcher — Ava + Turnover Shield + Write tracks, BigBang offload bridge"
 readme = "README.md"
 requires-python = ">=3.10"

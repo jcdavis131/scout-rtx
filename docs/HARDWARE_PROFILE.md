@@ -21,9 +21,13 @@ In `train.py` _resolve_gpu_profile:
 
 Profiles:
 - Turing 8-11GB: batch (8,4,2,1), checkpoint True, eval cap 4
-- Mid-tier 10-15GB: batch (16,8,4), checkpoint True, eval cap 4-? etc
+- Mid-tier 10-15GB: batch (16,8,4), checkpoint True, eval cap 16 (profile default)
 - 16GB: batch (32,16,8,4), checkpoint modes (False,True), default False, eval cap 16
 - 24GB+: batch (64,32,16,8,4), checkpoint False, eval cap 16
+
+Tier boundaries apply a ~0.5 GB tolerance (`VRAM_TIER_TOLERANCE_GB`) because real cards
+under-report total VRAM (a 16 GB card shows ~15.99 GB); so >=15.5 GB lands in the 16GB
+tier and >=23.5 GB in the 24GB+ tier.
 
 Your RTX 4080 16GB → `ada-16gb` profile: batch candidates 32,16,8,4, checkpoint modes (False,True), default False, eval cap 16. Autotune will pick 32 usually, maybe 16 if using checkpoint.
 Your RTX 4090 24GB → `ada-24gb-plus`: batch 64,32,16,8,4, checkpoint False, eval cap 16, autotune picks 64.
@@ -32,13 +36,18 @@ Your RTX 4090 24GB → `ada-24gb-plus`: batch 64,32,16,8,4, checkpoint False, ev
 
 We keep upstream profile logic but pre-document optimal candidates for your box:
 
-### RTX 4080 16GB (Ada, 9728 cores, 16GB GDDR6X, 320W, peak BF16 ~121 TFLOPS? actually 121 TFLOPS advertised, but our lookup ~242 TFLOPS for BF16? Check _get_gpu_peak_flops lookup table)
+### RTX 4080 16GB (Ada, 9728 cores, 16GB GDDR6X, 320W)
 
+- Peak FLOPS used for MFU: `_get_gpu_peak_flops` in train.py returns 242.5e12 (242.5 TFLOPS)
+  for "4080" — the dense BF16 tensor-core figure the fork's MFU math is calibrated against
+  (the "4080 super" entry is 260e12, matched first by substring order).
 - Recommended batch: 32 without checkpoint for MFU ~40%
 - If OOM near 16GB, fallback to 16 + checkpoint True
 - BF16 amp_dtype (torch.cuda.is_bf16_supported includes emulation false → true on Ada ≥8.0)
 - TF32 enabled: torch.backends.cuda.matmul.allow_tf32 = True
-- SDPA backend: uses PyTorch SDPA flash? Eager? Upstream says SDPA attention backend unified, no FA3.
+- SDPA backend: PyTorch SDPA run in eager mode — torch.compile is disabled in this fork's
+  runtime path, so there is no compiled/FA3 fast path; the SDPA kernel dispatch (flash/mem-efficient/math)
+  is left to PyTorch at runtime.
 - `PYTORCH_ALLOC_CONF=expandable_segments:True` mitigates fragmentation on Windows.
 
 ### RTX 4090 24GB (Ada, 16384 cores, 24GB GDDR6X, 450W, peak BF16 ~330 TFLOPS)
@@ -101,7 +110,7 @@ If BF16 false, fallback FP16 still works but slower.
 
 ## Notes for future Blackwell
 
-If you upgrade to RTX 5090 32GB Blackwell (12,0), same profile ada-24gb-plus logic applies? Actually Blackwell is 12,0 capability, also >=10GB floor. Our profile will treat as 24gb-plus, batch 64 etc. Peak FLOPS ~360 TFLOPS for 5090 per lookup.
+If you upgrade to RTX 5090 32GB Blackwell (12,0): Blackwell has capability (12,0) with the same >=10GB floor, so `_resolve_gpu_profile` yields the `blackwell-24gb-plus` profile — same batch candidates (64,32,16,8,4) and no default checkpointing as ada-24gb-plus. Peak FLOPS 360e12 for "5090" per the lookup table.
 
 ## Solo disclaimer
 

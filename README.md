@@ -26,12 +26,12 @@ cd scout-rtx
 ## Cloud → Local offload
 ```bash
 # In Hatch / anywhere
-scout rtx status                          # queue_pending, best 0.9935
+scout rtx status                          # queue_pending, best val_bpb so far
 scout rtx queue add --task "Optimize Ava router entropy 0.7" --program programs/program-ava.md
 scout rtx queue list
 scout rtx releases list                   # GH releases
-scout rtx releases sync --tag v0.6.0-demo-0715
-scout rtx results --best                  # best 0.9935
+scout rtx releases sync --tag v0.6.0-ava-0716
+scout rtx results --best                  # best val_bpb from real runs
 scout rtx dashboard                       # auto-reads every 60s
 ```
 
@@ -49,7 +49,7 @@ Hatch cloud (scout rtx releases list|sync)
 Dashboard rtx-offload-dashboard
   → server actions listGithubReleases + syncReleaseResults (parse TSV/JSONL dedup commit_sha)
   → UI GITHUB RELEASES section SYNC GH + IMPORT → LOG button
-  → bestOverall 0.9935 demo verified
+  → bestOverall computed from synced release results
 ```
 
 ### Commands
@@ -57,8 +57,8 @@ Dashboard rtx-offload-dashboard
 ```bash
 # Hatch cloud
 scout --json rtx status
-scout --json rtx releases list             # demo v0.6.0-demo-0715 with assets
-scout --json rtx releases sync --tag v0.6.0-demo-0715
+scout --json rtx releases list             # releases with assets
+scout --json rtx releases sync --tag v0.6.0-ava-0716
 scout --json rtx results --best
 
 # Alienware
@@ -72,10 +72,13 @@ scout rtx dashboard
 
 ### Verification (2026-07-15)
 
-- Demo release `v0.6.0-demo-0715` published with `results.tsv 337B 4 rows` + `results.jsonl 625B 3 rows` — best 0.9935
-- Dashboard DB: `sqlite3 app.db "SELECT COUNT(*), MIN(val_bpb) FROM experiment_results"` → 4, 0.9935
+- Pipeline verified end-to-end with a demo-seeded release `v0.6.0-demo-0715`
+  (`results.tsv 337B 4 rows` + `results.jsonl 625B 3 rows`). The 0.9935 val_bpb in that
+  release is a **synthetic demo value, not a real training result**. Publish scripts now
+  refuse to fabricate rows: they exit if `results.tsv` is missing unless `-Demo`/`--demo`
+  is passed, which tags the row `status=demo`.
 - GitHub API returns tag + assets verified via `scout --json rtx releases list`
-- Client `releasesQuery` refetchInterval 60_000 + server cron `rtx-releases-hourly-sync` interval@1h
+- Client `releasesQuery` refetchInterval 60_000 + server cron `rtx-releases-hourly-sync` interval@1h (in scout-cli dashboard)
 - Auto-publish wired in `run-autonomous.ps1` every 5 exps + final
 
 ### Programs
@@ -85,9 +88,9 @@ scout rtx dashboard
 - `program-write.md` — evolve write detector weights participial 0.5 char 0.8 phrase 3.0
 
 ### Files added v0.6.0
-- `scripts/publish-release.ps1/.sh` — GH release with TSV/JSONL assets
-- Dashboard: `server/src/actions.ts` fetchGithubReleases + parseTSV + listGithubReleases/syncReleaseResults/getReleaseCache + `server/src/schema.ts` githubReleases + `drizzle/0003_add_github_releases.sql` + `client/src/App.tsx` releasesQuery 60s + GITHUB RELEASES UI
-- Cron `rtx-releases-hourly-sync` hourly server sync
-- `run-autonomous.ps1` auto-publish every 5 exps + final
+- `scripts/publish-release.ps1/.sh` — GH release with TSV/JSONL assets (this repo)
+- `scripts/run-autonomous.ps1` auto-publish every 5 exps + final (this repo)
+- `bigbang-bridge/cli.py` — `scout rtx` plugin incl. `releases list|sync` (this repo)
+- Dashboard code (`server/src/actions.ts`, `server/src/schema.ts`, `drizzle/0003_add_github_releases.sql`, `client/src/App.tsx`, cron `rtx-releases-hourly-sync`) lives in [jcdavis131/scout-cli](https://github.com/jcdavis131/scout-cli), not in this repo
 
 Solo personal project, no connection to employer, built with public/free-tier only.

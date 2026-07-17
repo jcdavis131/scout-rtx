@@ -7,14 +7,30 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import typer
 
 from bigbang.core.output import emit
 
 app = typer.Typer(name="rtx", help="🚀 RTX — offload to Alienware RTX 4080/4090 local box", no_args_is_help=True)
 
-# Paths — cloud version points to workspace/autoresearch-rtx-custom which is where we built custom fork
-CUSTOM_ROOT = Path.home() / "workspace" / "autoresearch-rtx-custom"
+GITHUB_REPO = "jcdavis131/scout-rtx"
+GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+
+
+def _resolve_custom_root():
+    """Resolve the custom fork root: SCOUT_RTX_ROOT env override, then the legacy
+    autoresearch-rtx-custom checkout if present, else the scout-rtx checkout."""
+    env_root = os.environ.get("SCOUT_RTX_ROOT")
+    if env_root:
+        return Path(env_root).expanduser()
+    legacy = Path.home() / "workspace" / "autoresearch-rtx-custom"
+    if legacy.exists():
+        return legacy
+    return Path.home() / "workspace" / "scout-rtx"
+
+
+CUSTOM_ROOT = _resolve_custom_root()
 BB_OFFLOAD = CUSTOM_ROOT / "bb-offload"
 QUEUE_FILE = BB_OFFLOAD / "queue.json"
 RESULTS_FILE = BB_OFFLOAD / "results" / "results.jsonl"
@@ -139,8 +155,10 @@ def results(
     if not data:
         # fallback to results.tsv
         if RESULTS_TSV.exists():
-            tsv = RESULTS_TSV.read_text().strip().splitlines()[:n+1]
-            emit({"source": "results.tsv", "lines": tsv, "count": len(tsv)-1 if len(tsv)>0 else 0, "file": str(RESULTS_TSV)})
+            lines = RESULTS_TSV.read_text().strip().splitlines()
+            # header + last n data rows (docstring promises last N)
+            tsv = lines[:1] + lines[1:][-n:] if lines else []
+            emit({"source": "results.tsv", "lines": tsv, "count": max(len(tsv) - 1, 0), "file": str(RESULTS_TSV)})
             return
         emit({"results": [], "message": "No results yet — run in Alienware: .\\scripts\\run-autonomous.ps1"})
         return
@@ -184,9 +202,29 @@ def sync_cmd():
         return
     best = min(valid, key=lambda x: x["val_bpb"])
 
-    # Append to mrr jsonl as note if Turnover track
+    # Append a record to the MRR log so the sync is real, not a stub
+    note = f"RTX overnight best val_bpb {best['val_bpb']} from {best.get('program')} commit {best.get('commit')}"
+    mrr_record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "best": best["val_bpb"],
+        "program": best.get("program"),
+        "note": note,
+    }
+    try:
+        MRR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with MRR_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(mrr_record) + "\n")
+        mrr_written = True
+        mrr_error = None
+    except Exception as exc:
+        mrr_written = False
+        mrr_error = str(exc)
+
     payload = {
-        "synced": True,
+        "synced": mrr_written,
+        "mrr_file": str(MRR_FILE),
+        "mrr_record": mrr_record,
+        "mrr_error": mrr_error,
         "best": best,
         "results_count": len(results),
         "suggestion": f"Best val_bpb {best['val_bpb']} from {best.get('program')} commit {best.get('commit')} → promote to {'Ava v6.4' if 'ava' in str(best.get('program','')) else 'Turnover Shield' if 'turnover' in str(best.get('program','')) else 'write plugin'}",
@@ -199,10 +237,74 @@ def sync_cmd():
     }
     emit(payload)
 
+releases_app = typer.Typer(name="releases", help="GitHub releases for scout-rtx — list + sync", no_args_is_help=True)
+app.add_typer(releases_app, name="releases")
+
+
+def _fetch_releases(tag=None):
+    """Fetch releases from the GitHub API. Raises httpx errors on network failure."""
+    url = f"{GITHUB_RELEASES_URL}/tags/{tag}" if tag else GITHUB_RELEASES_URL
+    resp = httpx.get(
+        url,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "scout-rtx-cli"},
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _release_summary(rel):
+    return {
+        "tag": rel.get("tag_name"),
+        "name": rel.get("name"),
+        "published_at": rel.get("published_at"),
+        "url": rel.get("html_url"),
+        "assets": [
+            {"name": a.get("name"), "size": a.get("size"), "download_url": a.get("browser_download_url")}
+            for a in rel.get("assets", [])
+        ],
+    }
+
+
+@releases_app.command("list")
+def releases_list(n: int = typer.Option(10, "--n", help="max releases to show")):
+    """List GitHub releases for scout-rtx"""
+    try:
+        data = _fetch_releases()
+    except (httpx.HTTPError, OSError) as exc:
+        emit({"error": f"could not reach api.github.com: {exc}", "offline": True, "repo": GITHUB_REPO})
+        raise typer.Exit(1)
+    releases = [_release_summary(r) for r in data[:n]]
+    emit({"releases": releases, "count": len(releases), "repo": GITHUB_REPO})
+
+
+@releases_app.command("sync")
+def releases_sync(tag: str = typer.Option(..., "--tag", help="release tag to sync, e.g. v0.6.0-ava-0716")):
+    """Sync one release's metadata into bb-offload results for dashboard/Hatch pull"""
+    try:
+        rel = _fetch_releases(tag=tag)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            emit({"error": f"release tag {tag} not found on {GITHUB_REPO}", "tag": tag})
+        else:
+            emit({"error": f"GitHub API error: {exc}", "tag": tag})
+        raise typer.Exit(1)
+    except (httpx.HTTPError, OSError) as exc:
+        emit({"error": f"could not reach api.github.com: {exc}", "offline": True, "tag": tag})
+        raise typer.Exit(1)
+    summary = _release_summary(rel)
+    record = {"ts": datetime.now(timezone.utc).isoformat(), "synced_release": summary}
+    sync_log = BB_OFFLOAD / "results" / "releases-sync.jsonl"
+    _ensure_dirs()
+    with sync_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+    emit({"synced": True, "release": summary, "sync_log": str(sync_log)})
+
+
 @app.command("dashboard")
 def dashboard():
     """Show instructions to open RTX dashboard"""
-    web_path = CUSTOM_ROOT / "bigbang-bridge" / "dashboard.json"
     payload = {
         "message": "RTX dashboard — open via BigBang web artifact or check docs",
         "custom_root": str(CUSTOM_ROOT),
