@@ -45,6 +45,13 @@ while ($true) {
     $expCount++
     if ($MaxExperiments -gt 0 -and $expCount -gt $MaxExperiments) { break }
 
+    # Reset per-iteration state so stale values (e.g. a previous crash description)
+    # never leak into this experiment's log row.
+    $desc = ""
+    $val_bpb = 0.0
+    $peak_mb = 0.0
+    $status = "crash"
+
     Write-Host "`n--- Experiment #$expCount at $(Get-Date) ---" -ForegroundColor Cyan
 
     # Agent prompt — tell Claude/Codex to do one iteration
@@ -58,10 +65,8 @@ while ($true) {
     try {
         # Redirect all output, no tee to keep agent context clean
         uv run train.py > $logFile 2>&1
-        $success = $true
     } catch {
         Write-Host "train.py failed to start: $_" -ForegroundColor Red
-        $success = $false
     }
     $sw.Stop()
 
@@ -108,13 +113,10 @@ while ($true) {
     # For now, just log TSV
     if (-not $desc) { $desc = "exp $expCount $Program" }
 
-    # Append to TSV — agent should also do this but we ensure
+    # Append to TSV — always record every measurement (repeated runs of the same
+    # commit are distinct data points; the old commit-based dedup dropped them)
     $tsvLine = "$commit`t$val_bpb`t$mem_gb`t$status`t$desc"
-    # Only append if agent didn't already — check last line commit
-    $lastLine = Get-Content results.tsv -Tail 1 -ErrorAction SilentlyContinue
-    if (-not $lastLine.Contains($commit) -or $val_bpb -eq 0) {
-        Add-Content -Path results.tsv -Value $tsvLine -Encoding utf8
-    }
+    Add-Content -Path results.tsv -Value $tsvLine -Encoding utf8
 
     # Also sync to bb-offload results for Hatch cloud pull
     $queueDir = "bb-offload/results"

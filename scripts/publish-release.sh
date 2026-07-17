@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 set -e
-PROG=${1:-programs/program-ava.md}
-TAG=${2:-}
 REPO="jcdavis131/scout-rtx"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# Parse args: positional PROG TAG NOTES, plus optional --demo flag
+DEMO=0
+POSITIONAL=()
+for arg in "$@"; do
+  if [ "$arg" = "--demo" ]; then
+    DEMO=1
+  else
+    POSITIONAL+=("$arg")
+  fi
+done
+PROG=${POSITIONAL[0]:-programs/program-ava.md}
+TAG=${POSITIONAL[1]:-}
 
 if [ -z "$TAG" ]; then
   DATE=$(date +%m%d)
@@ -12,15 +23,21 @@ if [ -z "$TAG" ]; then
   TAG="v0.6.0-$P-$DATE"
 fi
 
-BEST=$(awk -F'\t' 'NR>1 {if($2+0<$b||NR==2){b=$2}} END{print b}' results.tsv 2>/dev/null || echo "unknown")
-NOTES=${3:-"Best val_bpb $BEST from $PROG commit $(git rev-parse --short HEAD 2>/dev/null)"}
+if [ ! -f results.tsv ]; then
+  if [ "$DEMO" = "1" ]; then
+    printf 'commit\tval_bpb\tmemory_gb\tstatus\tdescription\n' > results.tsv
+    printf 'demo000\t0.9979\t11.7\tdemo\tdemo row (synthetic, published with --demo)\n' >> results.tsv
+    echo "Demo mode: seeded results.tsv with a synthetic row tagged status=demo"
+  else
+    echo "error: no results.tsv — run experiments first (or pass --demo to publish a synthetic demo row)" >&2
+    exit 1
+  fi
+fi
+
+BEST=$(awk -F'\t' 'NR==2||$2+0<b{b=$2+0} END{if(b)print b; else print "unknown"}' results.tsv 2>/dev/null || echo "unknown")
+NOTES=${POSITIONAL[2]:-"Best val_bpb $BEST from $PROG commit $(git rev-parse --short HEAD 2>/dev/null)"}
 
 echo "Tag: $TAG Best: $BEST Program: $PROG"
-
-if [ ! -f results.tsv ]; then
-  echo -e "commit\tval_bpb\tmemory_gb\tstatus\tdescription" > results.tsv
-  echo -e "abc123\t0.9979\t11.7\tkeep\tbaseline RTX4090 24GB batch64" >> results.tsv
-fi
 
 ASSETS=("results.tsv")
 [ -f bb-offload/results/results.jsonl ] && ASSETS+=("bb-offload/results/results.jsonl")

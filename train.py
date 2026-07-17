@@ -41,7 +41,6 @@ class RuntimeConfig:
     device: torch.device
     device_type: str
     amp_dtype: torch.dtype
-    use_compile: bool
     use_activation_checkpointing: bool
     attention_backend: str
     gpu_name: str
@@ -77,6 +76,9 @@ MIN_SUPPORTED_VRAM_GB_BY_ARCH = {
     "blackwell": 10.0,
 }
 VRAM_FLOOR_TOLERANCE_GB = 0.05
+# Real cards under-report total VRAM (e.g. a 16 GB card shows ~15.99 GB), so tier
+# boundaries get a ~0.5 GB tolerance to keep the documented profiles reachable.
+VRAM_TIER_TOLERANCE_GB = 0.5
 AUTOTUNE_WARMUP_STEPS = 2
 AUTOTUNE_MEASURE_STEPS = 3
 AUTOTUNE_MAX_MEMORY_FRACTION = 0.90
@@ -135,7 +137,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
     )
 
     if supported_consumer:
-        if arch == "turing" and gpu_vram_gb < 12.0:
+        if arch == "turing" and gpu_vram_gb < (12.0 - VRAM_TIER_TOLERANCE_GB):
             return GpuProfile(
                 name=f"{arch}-8-11gb",
                 is_supported_consumer=True,
@@ -145,7 +147,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 default_checkpointing=True,
                 eval_batch_cap=4,
             )
-        if gpu_vram_gb < 16.0:
+        if gpu_vram_gb < (16.0 - VRAM_TIER_TOLERANCE_GB):
             mid_tier_name = f"{arch}-12-15gb" if arch == "turing" else f"{arch}-10-15gb"
             return GpuProfile(
                 name=mid_tier_name,
@@ -155,7 +157,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 checkpoint_modes=(True,),
                 default_checkpointing=True,
             )
-        if gpu_vram_gb < 24.0:
+        if gpu_vram_gb < (24.0 - VRAM_TIER_TOLERANCE_GB):
             return GpuProfile(
                 name=f"{arch}-16gb",
                 is_supported_consumer=True,
@@ -275,7 +277,6 @@ def detect_runtime():
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = tf32_enabled
 
-    use_compile = False
     print("torch.compile disabled in this fork runtime path.")
     attention_backend = "sdpa"
     print("Using PyTorch SDPA attention backend.")
@@ -291,7 +292,6 @@ def detect_runtime():
         device=device,
         device_type=device.type,
         amp_dtype=amp_dtype,
-        use_compile=use_compile,
         use_activation_checkpointing=use_activation_checkpointing,
         attention_backend=attention_backend,
         gpu_name=gpu_name,
@@ -1032,9 +1032,7 @@ def _prioritize_autotuned_candidate(train_candidates, autotuned_candidate):
 
 
 def _configure_step_kernels(runtime):
-    global ADAMW_STEP_IMPL, MUON_STEP_IMPL, USE_COMPILE, MUON_COMPUTE_DTYPE
-    ADAMW_STEP_IMPL = adamw_step_fused
-    MUON_STEP_IMPL = muon_step_fused
+    global MUON_COMPUTE_DTYPE
     if runtime.amp_dtype != torch.float16:
         MUON_COMPUTE_DTYPE = runtime.amp_dtype
         muon_reason = "matching AMP dtype"
@@ -1047,7 +1045,6 @@ def _configure_step_kernels(runtime):
         MUON_COMPUTE_DTYPE = torch.float32
         muon_reason = "fp16 AMP without bf16 support; using fp32 fallback"
     print(f"Muon compute dtype: {MUON_COMPUTE_DTYPE} ({muon_reason})")
-    USE_COMPILE = False
 
 
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):

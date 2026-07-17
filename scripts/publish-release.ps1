@@ -2,7 +2,8 @@ param(
   [string]$Program = "programs/program-ava.md",
   [string]$Tag = "",
   [string]$Notes = "",
-  [switch]$DryRun
+  [switch]$DryRun,
+  [switch]$Demo
 )
 # Publish current results.tsv + results.jsonl as GitHub release assets for scout-rtx
 # Usage: .\scripts\publish-release.ps1 -Program programs/program-ava.md -Tag v0.6.0-ava-0715
@@ -21,6 +22,18 @@ if (-not $Tag) {
 gh auth status | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Error "gh not logged in. Run gh auth login"; exit 1 }
 
+# Require real results unless -Demo is explicitly requested
+if (-not (Test-Path "results.tsv")) {
+  if ($Demo) {
+    "commit`tval_bpb`tmemory_gb`tstatus`tdescription" | Out-File -Encoding utf8 results.tsv
+    "demo000`t0.9979`t11.7`tdemo`tdemo row (synthetic, published with -Demo)" | Out-File -Encoding utf8 -Append results.tsv
+    Write-Host "Demo mode: seeded results.tsv with a synthetic row tagged status=demo" -ForegroundColor Yellow
+  } else {
+    Write-Error "no results.tsv - run experiments first (or pass -Demo to publish a synthetic demo row)"
+    exit 1
+  }
+}
+
 # Read best val_bpb from results.tsv if exists
 $best = "unknown"
 if (Test-Path "results.tsv") {
@@ -36,17 +49,12 @@ if (Test-Path "results.tsv") {
 }
 
 if (-not $Notes) {
-  $commit = (git rev-parse --short HEAD 2>$null) || "unknown"
+  $commit = git rev-parse --short HEAD 2>$null
+  if (-not $commit) { $commit = "unknown" }
   $Notes = "Best val_bpb $best from $Program commit $commit | Auto-published by publish-release.ps1 | See dashboard rtx-offload-dashboard"
 }
 
 Write-Host "Tag: $Tag | Best: $best | Program: $Program" -ForegroundColor Cyan
-
-# Create results files if missing (demo)
-if (-not (Test-Path "results.tsv")) {
-  "commit`tval_bpb`tmemory_gb`tstatus`tdescription" | Out-File -Encoding utf8 results.tsv
-  "abc123`t0.9979`t11.7`tkeep`tbaseline RTX4090 24GB batch64" | Out-File -Encoding utf8 -Append results.tsv
-}
 
 $assets = @()
 if (Test-Path "results.tsv") { $assets += "results.tsv" }
