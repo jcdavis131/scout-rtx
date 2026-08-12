@@ -1135,6 +1135,36 @@ def _split_loader_step_time(data_seconds, loader_gpu_wait_seconds):
     return data_seconds - wait, wait
 
 
+def _format_input_bound_lines(input_bound):
+    """Render the diagnostic as summary lines.
+
+    Split out from the final summary so the same four lines can be printed the
+    moment training returns, before eval. The measurement is complete at that
+    point, but everything downstream of it can still destroy the run: eval OOMs
+    at every candidate batch size and returns 1, evaluate_bpb raises a non-OOM
+    RuntimeError that nothing catches, or the lane's timeout kills the process
+    mid-eval. Each of those would throw away the one answer a GPU-lane run
+    exists to produce, after having already paid for the download, the
+    tokenizer and the training steps.
+    """
+    if input_bound is None:
+        return [
+            "dataloader_percent: n/a",
+            "gpu_wait_percent:   n/a",
+            "other_percent:      n/a",
+            "loop_bound:         n/a (needs at least 2 steps)",
+        ]
+    return [
+        f"dataloader_percent: {100 * input_bound['data_fraction']:.1f}",
+        f"gpu_wait_percent:   {100 * input_bound['gpu_wait_fraction']:.1f}",
+        f"other_percent:      {100 * input_bound['other_fraction']:.1f}",
+        (
+            f"loop_bound:         {input_bound['verdict']} "
+            f"(over {input_bound['sampled_steps']} step(s), step 0 excluded)"
+        ),
+    ]
+
+
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
     t_start = time.time()
     torch.manual_seed(42)
@@ -1432,6 +1462,15 @@ def main():
         print("FAIL: training failed for all batch size candidates.")
         return 1
 
+    # Emitted here, not only in the final summary: the loop diagnostic is
+    # already complete and nothing after this point can improve it, while eval
+    # and the lane timeout can both end the run before the summary is reached.
+    # The same lines are printed again below, so a passing run repeats them
+    # with identical values -- see _format_input_bound_lines.
+    print("[loop diagnostic] training complete; printed before eval so a failure there cannot discard it")
+    for line in _format_input_bound_lines(result["input_bound"]):
+        print(line)
+
     model = result["model"]
     _save_pre_eval_checkpoint(model)
     model.eval()
@@ -1493,20 +1532,8 @@ def main():
         print("mfu_percent:      n/a")
     else:
         print(f"mfu_percent:      {steady_state_mfu:.2f}")
-    input_bound = result["input_bound"]
-    if input_bound is None:
-        print("dataloader_percent: n/a")
-        print("gpu_wait_percent:   n/a")
-        print("other_percent:      n/a")
-        print("loop_bound:         n/a (needs at least 2 steps)")
-    else:
-        print(f"dataloader_percent: {100 * input_bound['data_fraction']:.1f}")
-        print(f"gpu_wait_percent:   {100 * input_bound['gpu_wait_fraction']:.1f}")
-        print(f"other_percent:      {100 * input_bound['other_fraction']:.1f}")
-        print(
-            f"loop_bound:         {input_bound['verdict']} "
-            f"(over {input_bound['sampled_steps']} step(s), step 0 excluded)"
-        )
+    for line in _format_input_bound_lines(result["input_bound"]):
+        print(line)
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")

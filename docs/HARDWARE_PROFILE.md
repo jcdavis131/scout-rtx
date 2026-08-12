@@ -97,6 +97,19 @@ other_percent:      <the share the two timed columns do not account for>
 loop_bound:         input-bound | compute-bound | mixed
 ```
 
+It prints the same four lines a second time, earlier — the moment training
+returns, under a `[loop diagnostic]` header, before the checkpoint save and the
+eval. The measurement is finished at that point and nothing downstream improves
+it, but three things downstream can still end the run before the final summary:
+eval OOMs at every candidate batch size (`return 1`), `evaluate_bpb` raises a
+non-OOM error that nothing catches, or the lane's `timeoutMs` kills the process
+mid-eval. Any of those would discard the one answer the run exists to produce
+*after* having already paid for the parquet download, the tokenizer and the
+training steps — an hour of GPU lane for nothing. A passing run therefore
+reports these values twice, identically; that repetition is the point, not a
+bug. Both emit points go through `_format_input_bound_lines`, so they cannot
+drift apart.
+
 `gpu_wait_percent` covers the three points where the CPU actually blocks on the device: the
 `train_loss.item()` read, the trailing `torch.cuda.synchronize()`, and the dataloader's wait
 for its previous host-to-device copy to land. The first two already existed in the loop.
