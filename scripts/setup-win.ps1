@@ -44,7 +44,7 @@ if (-not $SkipSetup) {
     Write-Host "Running prepare.py (downloads TinyStories GPT-4 clean)..." -ForegroundColor Yellow
     uv run prepare.py
 } else {
-    Write-Host "SkipSetup flag — skipping prepare.py" -ForegroundColor Yellow
+    Write-Host "SkipSetup flag - skipping prepare.py" -ForegroundColor Yellow
 }
 
 # 6. Smoke test
@@ -68,7 +68,7 @@ if (Get-Command ollama -ErrorAction SilentlyContinue) {
     Write-Host "Ollama found, listing models..." -ForegroundColor Yellow
     ollama list
 } else {
-    Write-Host "Ollama not found — optional, for Frontier rubric judging. Install via winget install Ollama.Ollama" -ForegroundColor Yellow
+    Write-Host "Ollama not found - optional, for Frontier rubric judging. Install via winget install Ollama.Ollama" -ForegroundColor Yellow
 }
 
 Write-Host "`n=== Setup complete ===" -ForegroundColor Green

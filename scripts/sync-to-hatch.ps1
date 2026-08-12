@@ -45,7 +45,7 @@ if (-not $Watch) {
     exit 0
 }
 
-Write-Host "Watching every $IntervalSec sec — Ctrl+C to stop" -ForegroundColor Cyan
+Write-Host "Watching every $IntervalSec sec - Ctrl+C to stop" -ForegroundColor Cyan
 while ($true) {
     Clear-Host
     Write-Host "=== Hatch Sync Watch $(Get-Date) ===" -ForegroundColor Cyan
