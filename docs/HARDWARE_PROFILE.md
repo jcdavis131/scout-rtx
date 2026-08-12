@@ -91,17 +91,39 @@ That is a strong prior, not a measurement — hence the instrument below.
 `train.py` prints three lines in its final summary:
 
 ```
-dataloader_percent: <share of step wall-clock spent inside next(train_loader)>
+dataloader_percent: <share of step wall-clock building batches in next(train_loader)>
 gpu_wait_percent:   <share spent blocked on the GPU>
 loop_bound:         input-bound | compute-bound | mixed
 ```
 
-`gpu_wait_percent` covers the two points where the CPU actually blocks on the device: the
-`train_loss.item()` read and the trailing `torch.cuda.synchronize()`. Both already existed
-in the loop — **no synchronization point was added**, so the instrument does not perturb
-what it measures. Timing only the trailing synchronize would have been wrong: `.item()`
-drains most of the queue first, so on a compute-bound run the GPU wait would have vanished
-into unattributed step time.
+`gpu_wait_percent` covers the three points where the CPU actually blocks on the device: the
+`train_loss.item()` read, the trailing `torch.cuda.synchronize()`, and the dataloader's wait
+for its previous host-to-device copy to land. The first two already existed in the loop.
+The third is inside `make_dataloader` and is there for correctness, not measurement — see
+*The pinned-buffer wait* below — but it is timed and charged to `gpu_wait_percent` rather
+than to `dataloader_percent`, because a device wait counted as batch-building time is
+exactly how a compute-bound loop would misreport as input-bound.
+
+Timing only the trailing synchronize would have been wrong: `.item()` drains most of the
+queue first, so on a compute-bound run the GPU wait would have vanished into unattributed
+step time.
+
+### The pinned-buffer wait
+
+`make_dataloader` stages each batch in one pinned CPU buffer and enqueues the copy to the
+GPU with `non_blocking=True`. That copy reads the buffer when the stream reaches it, not
+when `copy_` returns. `train.py` queues `grad_accum_steps` microbatches between
+synchronization points, so the host can run far enough ahead to overwrite the buffer while
+the previous copy is still in flight — handing the GPU *this* batch's tokens for the
+*previous* batch, with correct shapes and a loss that still falls. The loader now waits on
+a CUDA event before reusing the buffer.
+
+The hazard is latent in the input-bound regime (the GPU keeps up, so there is nothing in
+flight to clobber) and fires when compute-bound. It never affected `val_bpb`: `evaluate_bpb`
+calls `.item()` every iteration, which blocks past each copy before the next one is staged.
+Autotune (`_benchmark_train_candidate`) has the same run-ahead as training, but it reports
+`tok_per_sec` and peak memory — batch *content* does not change what that costs, so its
+numbers were valid either way.
 
 Reading it (`_classify_step_bound` in `train.py`):
 

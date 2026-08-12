@@ -310,6 +310,139 @@ def test_fractions_are_relative_to_sampled_wall_time():
     assert result["verdict"] == "mixed"
 
 
+# --- loader device-wait attribution ----------------------------------------
+
+def test_loader_wait_moves_from_data_to_gpu_wait():
+    data, gpu_wait = train._split_loader_step_time(1.0, 0.25)
+    assert data == pytest.approx(0.75)
+    assert gpu_wait == pytest.approx(0.25)
+
+
+def test_no_loader_wait_leaves_data_untouched():
+    assert train._split_loader_step_time(1.0, 0.0) == (1.0, 0.0)
+
+
+def test_float_noise_cannot_make_either_column_negative():
+    # the wait is measured inside the data region, so a tiny negative delta is
+    # noise, not a signal
+    data, gpu_wait = train._split_loader_step_time(1.0, -1e-12)
+    assert data == pytest.approx(1.0)
+    assert gpu_wait == 0.0
+
+
+def test_wait_is_clamped_to_the_time_it_was_measured_inside():
+    data, gpu_wait = train._split_loader_step_time(0.5, 0.9)
+    assert (data, gpu_wait) == (0.0, 0.5)
+
+
+def test_split_conserves_total_step_time():
+    data, gpu_wait = train._split_loader_step_time(2.0, 0.75)
+    assert data + gpu_wait == pytest.approx(2.0)
+
+
+def test_unattributed_loader_wait_would_invert_the_verdict():
+    # A compute-bound step: next() measured 0.7s wall, but 0.6s of that was the
+    # loader blocked on its own host-to-device copy, and .item() only had 0.1s
+    # of queue left to drain. Charging the copy wait to data time reads as
+    # "input-bound" -- the exact misdiagnosis _split_loader_step_time prevents.
+    raw_data, item_wait, wall = 0.7, 0.1, 1.0
+    assert classify(data=raw_data, gpu_wait=item_wait, wall=wall)["verdict"] == "input-bound"
+
+    data, loader_wait = train._split_loader_step_time(raw_data, 0.6)
+    result = classify(data=data, gpu_wait=loader_wait + item_wait, wall=wall)
+    assert result["verdict"] == "compute-bound"
+
+
+# --- dataloader CPU path ---------------------------------------------------
+
+class _FixedLengthTokenizer:
+    """Emits documents of exactly row_capacity tokens, each id used once.
+
+    Unique ascending ids make batch-content bugs visible: a duplicated or
+    half-overwritten batch shows up as a repeated or non-contiguous id run.
+    """
+
+    dataset = "tinystories"
+
+    def __init__(self, doc_len):
+        self.doc_len = doc_len
+        self.next_id = 100
+
+    def get_bos_token_id(self):
+        return 0
+
+    def encode(self, texts, prepend=None):
+        encoded = []
+        for _ in texts:
+            encoded.append([prepend] + [self.next_id + i for i in range(self.doc_len - 1)])
+            self.next_id += self.doc_len
+        return encoded
+
+
+@pytest.fixture
+def cpu_loader(monkeypatch):
+    def fake_document_batches(split, dataset=None, tokenizer_batch_size=128):
+        while True:
+            yield ["doc"] * 4, 1
+
+    monkeypatch.setattr(prepare, "_document_batches", fake_document_batches)
+
+    def build(B, T, stats=None):
+        return prepare.make_dataloader(
+            _FixedLengthTokenizer(doc_len=T + 1),
+            B,
+            T,
+            "train",
+            device="cpu",
+            dataset="tinystories",
+            buffer_size=8,
+            stats=stats,
+        )
+
+    return build
+
+
+def test_cpu_loader_packs_full_rows_and_shifts_targets(cpu_loader):
+    loader = cpu_loader(B=2, T=4)
+    inputs, targets, epoch = next(loader)
+    # inputs/targets alias one reusable buffer, so a caller comparing batches
+    # must copy -- true before this change and unchanged by it
+    inputs, targets = inputs.clone(), targets.clone()
+
+    assert inputs.shape == (2, 4)
+    assert targets.shape == (2, 4)
+    assert inputs.dtype == torch.long
+    assert epoch == 1
+    # every row starts with BOS and is one document, so targets is inputs shifted
+    assert inputs[0].tolist() == [0, 100, 101, 102]
+    assert targets[0].tolist() == [100, 101, 102, 103]
+    assert inputs[1].tolist() == [0, 105, 106, 107]
+
+
+def test_cpu_loader_yields_distinct_successive_batches(cpu_loader):
+    loader = cpu_loader(B=2, T=4)
+    first = next(loader)[0].clone()
+    second = next(loader)[0].clone()
+    assert not torch.equal(first, second)
+    # documents are consumed in order, so batch 2 continues where batch 1 stopped
+    assert second[0].tolist() == [0, 110, 111, 112]
+
+
+def test_cpu_loader_records_no_device_wait(cpu_loader):
+    # there is no host-to-device copy to wait on off the GPU, so the stats dict
+    # must stay untouched rather than accumulating a bogus zero-wait entry
+    stats = {"gpu_wait_seconds": 0.0}
+    loader = cpu_loader(B=2, T=4, stats=stats)
+    for _ in range(3):
+        next(loader)
+    assert stats == {"gpu_wait_seconds": 0.0}
+
+
+def test_loader_accepts_no_stats(cpu_loader):
+    loader = cpu_loader(B=2, T=4, stats=None)
+    assert next(loader)[0].shape == (2, 4)
+
+
 # --- misc runtime plumbing -------------------------------------------------
 
 def test_runtime_config_has_no_use_compile_field():

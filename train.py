@@ -1059,15 +1059,23 @@ def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_s
     """Report whether the loop is starved by CPU-side batch building.
 
     make_dataloader is a single-process Python generator called inline in the
-    gradient-accumulation loop, so its cost lands on the critical path. Two
-    blocking points that already exist in the loop are timed to tell the two
-    cases apart -- no synchronization point is added:
+    gradient-accumulation loop, so its cost lands on the critical path. Step time
+    is split into two columns to tell the two cases apart:
 
-      data_seconds      wall-clock inside next(train_loader). Pure CPU work;
-                        previously queued GPU kernels keep running through it.
+      data_seconds      wall-clock inside next(train_loader), minus the loader's
+                        own device wait (below). Pure CPU work; previously queued
+                        GPU kernels keep running through it.
       gpu_wait_seconds  wall-clock the CPU spends blocked on the GPU: the
-                        train_loss.item() device read plus the trailing
-                        torch.cuda.synchronize().
+                        train_loss.item() device read, the trailing
+                        torch.cuda.synchronize(), and the loader's wait for its
+                        previous host-to-device copy to land.
+
+    Two of those three blocking points already existed in the loop. The third
+    lives inside make_dataloader and is required for correctness, not for
+    measurement -- it is what stops the host from overwriting a pinned buffer
+    whose copy is still in flight. It is timed and charged here to gpu_wait
+    rather than to data, because charging a device wait to batch-building time
+    is exactly how a compute-bound loop would misreport as input-bound.
 
     A loop that cannot feed its GPU spends most of the step in the first and
     almost none in the second, because the GPU drains the queue faster than the
@@ -1093,6 +1101,24 @@ def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_s
         "gpu_wait_fraction": gpu_wait_fraction,
         "sampled_steps": sampled_steps,
     }
+
+
+def _split_loader_step_time(data_seconds, loader_gpu_wait_seconds):
+    """Move the loader's device wait out of the data column.
+
+    next(train_loader) blocks once per batch until the previous host-to-device
+    copy has landed (see make_dataloader). That wall-clock is measured inside
+    next(), so it arrives here bundled into data_seconds, but it is time the host
+    spends blocked on the GPU. Leaving it in the data column would inflate
+    data_fraction and deflate gpu_wait_fraction on precisely the runs where the
+    GPU is the bottleneck -- the misdiagnosis this instrument exists to prevent.
+
+    Returns (data_seconds, gpu_wait_seconds) with the wait moved across. The wait
+    is clamped into [0, data_seconds]: it happened inside the timed region, so it
+    cannot exceed it, and float noise must not push either column negative.
+    """
+    wait = max(0.0, min(loader_gpu_wait_seconds, data_seconds))
+    return data_seconds - wait, wait
 
 
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
@@ -1129,6 +1155,10 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     )
     model = _maybe_compile(model, dynamic=False)
 
+    # The loader reports the time it spends blocked on its own host-to-device
+    # copy here, so that wait can be attributed to the GPU instead of to batch
+    # building; see _split_loader_step_time.
+    loader_stats = {"gpu_wait_seconds": 0.0}
     train_loader = make_dataloader(
         tokenizer,
         device_batch_size,
@@ -1136,6 +1166,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "train",
         device=runtime.device,
         dataset=tokenizer.dataset,
+        stats=loader_stats,
     )
     x, y, epoch = next(train_loader)
     print(f"Time budget: {TIME_BUDGET}s")
@@ -1173,6 +1204,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         torch.cuda.synchronize()
         t0 = time.time()
         step_data_seconds = 0.0
+        loader_wait_before = loader_stats["gpu_wait_seconds"]
         for _ in range(grad_accum_steps):
             with autocast_ctx:
                 loss = model(x, y)
@@ -1182,6 +1214,10 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
             t_data0 = time.time()
             x, y, epoch = next(train_loader)
             step_data_seconds += time.time() - t_data0
+        step_data_seconds, step_gpu_wait_seconds = _split_loader_step_time(
+            step_data_seconds,
+            loader_stats["gpu_wait_seconds"] - loader_wait_before,
+        )
 
         progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
         lrm = get_lr_multiplier(progress)
@@ -1201,7 +1237,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         # step time on a compute-bound run.
         t_wait0 = time.time()
         train_loss_f = train_loss.item()
-        step_gpu_wait_seconds = time.time() - t_wait0
+        step_gpu_wait_seconds += time.time() - t_wait0
         if train_loss_f > 100:
             raise RuntimeError("FAIL: training loss exploded")
 

@@ -437,12 +437,18 @@ def _document_batches(split, dataset=None, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_size=1000, stats=None):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
     When no document fits remaining space, crops shortest doc to fill exactly.
     100% utilization (no padding).
+
+    `stats`, when supplied, is a dict this loader accumulates a "gpu_wait_seconds"
+    key into: the wall-clock it spends blocked waiting for the previous
+    host-to-device copy to land. A caller that measures where step time goes needs
+    that time charged to the GPU rather than to batch building -- see the copy
+    site below.
     """
     dataset_name = _resolve_dataset_name(dataset or getattr(tokenizer, "dataset", None))
     if split == "test":
@@ -472,10 +478,13 @@ def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_
         gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=resolved_device)
         inputs = gpu_buffer[:B * T].view(B, T)
         targets = gpu_buffer[B * T:].view(B, T)
+        copy_done = torch.cuda.Event()
     else:
         gpu_buffer = None
         inputs = cpu_inputs
         targets = cpu_targets
+        copy_done = None
+    copy_pending = False
 
     while True:
         for row_idx in range(B):
@@ -504,10 +513,33 @@ def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_
                     row_buffer[row_idx, pos:pos + remaining] = torch.as_tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
+        # cpu_buffer is pinned and the copy below is enqueued with
+        # non_blocking=True, so the DMA reads it when the stream reaches it, not
+        # when copy_ returns. A caller that runs ahead of the device -- train.py
+        # queues grad_accum_steps microbatches between syncs -- would otherwise
+        # overwrite cpu_buffer here while the previous copy is still in flight,
+        # handing the GPU *this* batch's tokens for the *previous* batch. That
+        # failure is silent: the shapes are right and the loss still falls.
+        # Waiting on the copy before reusing the buffer closes it. The packing
+        # loop above already ran alongside that copy, so the wait is usually
+        # zero; when it is not, it is time blocked on the device, and reporting
+        # it as such is what keeps a compute-bound loop from reading as
+        # input-bound in train.py's diagnostic.
+        if copy_pending:
+            t_wait0 = time.time()
+            copy_done.synchronize()
+            if stats is not None:
+                stats["gpu_wait_seconds"] = (
+                    stats.get("gpu_wait_seconds", 0.0) + time.time() - t_wait0
+                )
+            copy_pending = False
+
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
         if use_cuda:
             gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+            copy_done.record()
+            copy_pending = True
         yield inputs, targets, epoch
 
 
