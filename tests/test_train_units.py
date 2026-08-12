@@ -310,6 +310,44 @@ def test_fractions_are_relative_to_sampled_wall_time():
     assert result["verdict"] == "mixed"
 
 
+# --- the residual column ---------------------------------------------------
+
+def test_three_columns_account_for_the_whole_step():
+    result = classify(data=0.3, gpu_wait=0.2)
+    assert result["other_fraction"] == pytest.approx(0.5)
+    total = result["data_fraction"] + result["gpu_wait_fraction"] + result["other_fraction"]
+    assert total == pytest.approx(1.0)
+
+
+def test_residual_is_clamped_to_zero_by_float_noise():
+    # Both columns are timed sub-intervals of the same step, so they can only
+    # exceed its wall clock by noise -- which must not print as a negative share.
+    assert classify(data=0.5, gpu_wait=0.5 + 1e-12)["other_fraction"] == 0.0
+
+
+def test_residual_does_not_move_the_verdict():
+    # Same two timed columns, different amounts of unaccounted step time: the
+    # residual is reported, never folded into either side of the threshold.
+    starved = classify(data=0.8, gpu_wait=0.05)
+    assert starved["verdict"] == "input-bound"
+    assert starved["other_fraction"] == pytest.approx(0.15)
+
+    diluted = classify(data=0.8, gpu_wait=0.05, wall=2.0)
+    assert diluted["verdict"] == "mixed"
+    assert diluted["other_fraction"] == pytest.approx(0.575)
+
+
+def test_large_residual_is_what_makes_mixed_readable():
+    # The likely shape of a first smoke run: the dataloader is busy and the CPU
+    # rarely blocks on the device, yet most of the step is in neither column.
+    # That remainder is kernel-enqueue time and possibly launch-queue
+    # backpressure -- hidden GPU wait -- so "mixed" must not be read as
+    # input-bound headroom.
+    result = classify(data=0.35, gpu_wait=0.10)
+    assert result["verdict"] == "mixed"
+    assert result["other_fraction"] > result["data_fraction"]
+
+
 # --- loader device-wait attribution ----------------------------------------
 
 def test_loader_wait_moves_from_data_to_gpu_wait():
