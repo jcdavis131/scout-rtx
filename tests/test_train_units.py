@@ -221,6 +221,46 @@ def test_evaluate_bpb_excludes_zero_byte_tokens(monkeypatch):
     assert bpb == pytest.approx(0.5, rel=1e-6)
 
 
+# --- run artifact directory ------------------------------------------------
+
+class _StubModel:
+    def state_dict(self):
+        return {"w": torch.zeros(1)}
+
+
+def test_resolve_out_dir_defaults_to_cwd(monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_OUT_DIR", raising=False)
+    assert train._resolve_out_dir() == "."
+
+
+def test_resolve_out_dir_ignores_empty_env(monkeypatch):
+    monkeypatch.setenv("AUTORESEARCH_OUT_DIR", "")
+    assert train._resolve_out_dir() == "."
+
+
+def test_checkpoint_lands_in_out_dir_and_not_cwd(tmp_path, monkeypatch):
+    # A containerized run must not drop a checkpoint into the checked-out repo.
+    cwd = tmp_path / "work"
+    out_dir = tmp_path / "out" / "nested"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("AUTORESEARCH_OUT_DIR", str(out_dir))
+
+    train._save_pre_eval_checkpoint(_StubModel())
+
+    assert (out_dir / "checkpoint_pre_eval.pt").exists()  # created the dir too
+    assert list(cwd.iterdir()) == []
+
+
+def test_checkpoint_defaults_to_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_OUT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    train._save_pre_eval_checkpoint(_StubModel())
+
+    assert (tmp_path / "checkpoint_pre_eval.pt").exists()
+
+
 # --- misc runtime plumbing -------------------------------------------------
 
 def test_runtime_config_has_no_use_compile_field():

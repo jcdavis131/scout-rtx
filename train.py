@@ -1195,11 +1195,25 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     }
 
 
+def _resolve_out_dir():
+    """Directory for run artifacts.
+
+    Defaults to the working directory, which is what every existing script
+    expects. Containerized runs set AUTORESEARCH_OUT_DIR so a measuring run
+    writes its checkpoint to a mounted output directory instead of into the
+    checked-out repo.
+    """
+    return os.environ.get("AUTORESEARCH_OUT_DIR") or "."
+
+
 def _save_pre_eval_checkpoint(model):
     try:
         state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
-        torch.save(state_dict, "checkpoint_pre_eval.pt")
-        print("Saved checkpoint_pre_eval.pt")
+        out_dir = _resolve_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "checkpoint_pre_eval.pt")
+        torch.save(state_dict, path)
+        print(f"Saved {path}")
     except Exception as exc:  # pragma: no cover
         print(f"Warning: could not save pre-eval checkpoint: {exc}")
 

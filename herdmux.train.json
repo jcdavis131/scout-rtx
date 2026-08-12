@@ -1,0 +1,24 @@
+{
+  "$": "Opts scout-rtx into the herdmux GPU lane. v1 is deliberately minimal: its job is to prove the lane runs end to end on real hardware, not to train or benchmark anything.",
+
+  "$command": "Matches this repo's actual entrypoints. prepare.py downloads the TinyStories parquet and trains the BPE tokenizer; train.py --smoke-test is its own short path (3 optimizer steps, then a bpb eval over 65,536 tokens). train.py has no --epochs or --out flag, so the small-run knob is --smoke-test and the artifact path is AUTORESEARCH_OUT_DIR. torch is deliberately NOT installed -- the image supplies it, and pyproject's cu128 pin would fight a cuda124 image. The four packages listed are exactly prepare.py's non-torch imports. If rustbpe has no wheel for the image's Python, this fails in the install step before any GPU work, which is a legible failure rather than a silent one.",
+  "command": "pip install -q pyarrow requests rustbpe tiktoken && python -u prepare.py && python -u train.py --smoke-test",
+
+  "$readOnly": "This repo ships no model weights, so there is nothing model-shaped to protect. bb-offload holds committed queue state and programs/ holds the committed experiment specs; neither is an input a trainer has any reason to write.",
+  "readOnly": ["bb-offload", "programs"],
+
+  "$env": "AUTORESEARCH_CACHE_DIR is prepare.py's existing knob. Pointing it at the persistent /cache mount means only the first run pays for the ~1 GB parquet download and the BPE tokenizer training -- prepare.py is idempotent and returns immediately once both exist, so run 2 onward is just the smoke train. AUTORESEARCH_OUT_DIR keeps checkpoint_pre_eval.pt out of /work: the default is the working directory, which here is the published worktree.",
+  "env": {
+    "AUTORESEARCH_CACHE_DIR": "/cache/autoresearch",
+    "AUTORESEARCH_OUT_DIR": "/out"
+  },
+
+  "$timeoutMs": "Sized for the first run (download + tokenizer training + smoke train). Later runs should finish in a small fraction of this; if they do not, that is itself the finding.",
+  "timeoutMs": 3600000,
+
+  "$shmSize": "This trainer's dataloader is a single-process Python generator with zero worker processes, so shm is not load-bearing here -- 1g is headroom, not a tuning choice. Kept with memory under the VM's ~7.75 GB.",
+  "shmSize": "1g",
+  "memory": "6g",
+
+  "$expect": "What a passing run looks like, so nobody reads a correct run as a broken one. The RTX 4080 Laptop GPU resolves to the 'compatibility' profile (train.py:_resolve_gpu_profile treats any 'laptop' name as outside the supported desktop matrix), which also means autotune is skipped and batch candidates are 16, 8, 4 with activation checkpointing on. --smoke-test stops at 3 steps, and train.py only accumulates timing after step 10, so a healthy smoke run prints training_seconds: 0.0 and mfu_percent: n/a. val_bpb is real but untrained-model noise. This run answers 'does the lane execute', nothing else."
+}

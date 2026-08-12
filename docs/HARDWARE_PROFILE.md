@@ -62,6 +62,10 @@ We keep upstream profile logic but pre-document optimal candidates for your box:
 - No torch.compile (disabled in this fork runtime path) to keep stability on Windows consumer GPUs. Original upstream had FA3/fast path on H100 but removed for Windows.
 - Autotune: short eager-mode pass with 2 warmup + 3 measure steps, 90% memory fraction, caches per GPU fingerprint to `%LOCALAPPDATA%\autoresearch\gpu-profile-v2.json`. Use `AUTORESEARCH_DISABLE_AUTOTUNE=1` to skip, `AUTORESEARCH_AUTOTUNE_REFRESH=1` to refresh.
 - Windows-specific: LOCALAPPDATA cache, not .cache.
+- Run artifacts: `checkpoint_pre_eval.pt` is written to `AUTORESEARCH_OUT_DIR` when set, otherwise
+  to the working directory (unchanged default). Containerized runs set it to a mounted output
+  directory so a measuring run never leaves a checkpoint inside the checked-out repo — see
+  `herdmux.train.json`.
 
 ## How autoresearch finds best model for your platform
 
