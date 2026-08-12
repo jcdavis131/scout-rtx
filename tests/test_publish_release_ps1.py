@@ -244,6 +244,35 @@ def test_failed_gh_call_is_not_reported_as_success(tmp_path, view_exit, failing_
     assert DONE_BANNER not in proc.stdout, "failed publish printed the success banner"
 
 
+# --- a crash is not a record result ---------------------------------------
+
+# run-autonomous.ps1 appends this when train.py produced no `val_bpb:` line.
+# Lower bpb is better, so 0 is the best value the column can hold: an unfiltered
+# minimum publishes a night of crashes as the best run ever recorded.
+CRASH_ROW = "c9\t0\t0\tcrash\tcrash"
+NO_LOG_ROW = "c8\t0\t0\tcrash\tno log"
+
+
+def test_crash_row_is_not_published_as_best(tmp_path):
+    _write_results(tmp_path, "c1\t1.0500\t10\tkeep\ta", CRASH_ROW)
+    proc, log = _run(tmp_path, *BASE_ARGS)
+    assert proc.returncode == 0, proc.stderr
+    assert "| Best: 1.05 |" in proc.stdout, "crash outranked the only real run"
+    # The notes are what the release page and the dashboard actually show.
+    assert "Best val_bpb 1.05" in log
+
+
+def test_all_crash_publishes_unknown_not_zero(tmp_path):
+    """Nothing measured must read as nothing measured. The release still goes
+    out -- the assets are the honest record -- but it cannot claim a 0."""
+    _write_results(tmp_path, CRASH_ROW, NO_LOG_ROW)
+    proc, log = _run(tmp_path, *BASE_ARGS)
+    assert proc.returncode == 0, proc.stderr
+    assert "| Best: unknown |" in proc.stdout
+    assert "release create" in log
+    assert "Best val_bpb unknown" in log
+
+
 def test_commit_falls_back_to_unknown_outside_git_repo(tmp_path):
     """`git rev-parse ... 2>$null` intended a fallback; the redirect made it fatal."""
     _write_results(tmp_path, "c1\t0.9812\t11\tkeep\tb")

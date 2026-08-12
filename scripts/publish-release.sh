@@ -34,7 +34,12 @@ if [ ! -f results.tsv ]; then
   fi
 fi
 
-BEST=$(awk -F'\t' 'NR==2||$2+0<b{b=$2+0} END{if(b)print b; else print "unknown"}' results.tsv 2>/dev/null || echo "unknown")
+# Skip val_bpb <= 0: a crashed run is logged with val_bpb 0 (run-autonomous.ps1)
+# and lower bpb is better, so an unfiltered minimum lets one crash beat every real
+# run. `f` rather than `if(b)` decides whether anything was measured -- awk reads a
+# minimum of 0 as false, so the old END branch answered "unknown" for a file that
+# held real results next to a crash.
+BEST=$(awk -F'\t' 'NR>1 && $2+0>0 && (!f || $2+0<b){b=$2+0; f=1} END{if(f)print b; else print "unknown"}' results.tsv 2>/dev/null || echo "unknown")
 NOTES=${POSITIONAL[2]:-"Best val_bpb $BEST from $PROG commit $(git rev-parse --short HEAD 2>/dev/null)"}
 
 echo "Tag: $TAG Best: $BEST Program: $PROG"

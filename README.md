@@ -38,6 +38,8 @@ scout rtx dashboard
 
 The end-to-end pipeline was verified 2026-07-15 with a demo-seeded release (`v0.6.0-demo-0715`). The 0.9935 val_bpb in that release is a synthetic demo value, not a real training result. Publish scripts refuse to fabricate rows: they exit if `results.tsv` is missing unless an explicit `-Demo`/`--demo` flag is passed, which tags the row `status=demo`.
 
+A crashed experiment is recorded with `val_bpb 0` and `status=crash`. Lower bpb is better, so 0 would otherwise be the best value the column can hold — every reader of "best val_bpb" (both publish scripts, `scout rtx status`, `scout rtx results --best`, `scout rtx sync`) therefore skips non-positive values. A run of nothing but crashes reports `unknown`, not a perfect score.
+
 Dashboard server code (actions, schema, cron sync) lives in [scout-cli](https://github.com/jcdavis131/scout-cli), not in this repo. The upstream project's original README is preserved as `README.upstream.md`.
 
 Solo personal project, no connection to employer, built with public/free-tier only.

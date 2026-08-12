@@ -78,6 +78,40 @@ def test_results_tsv_fallback_returns_last_n(cli_mod, emit_records):
     assert payload["count"] == 3
 
 
+# --- status: a crashed run is not the best result --------------------------
+
+# What run-autonomous.ps1 appends when train.py produced no `val_bpb:` line:
+# val_bpb 0.0, status crash. Lower bpb is better, so 0 is the best value the
+# column can hold -- an unfiltered minimum turns a crash into a record result.
+CRASH_ROW = "c9\t0\t0\tcrash\tcrash"
+NO_LOG_ROW = "c8\t0\t0\tcrash\tno log"
+
+
+def _seed_tsv(cli_mod, *rows):
+    header = "commit\tval_bpb\tmemory_gb\tstatus\tdescription"
+    cli_mod.RESULTS_TSV.parent.mkdir(parents=True, exist_ok=True)
+    cli_mod.RESULTS_TSV.write_text("\n".join([header, *rows]) + "\n")
+
+
+def test_status_best_ignores_crashed_runs(cli_mod, emit_records):
+    _seed_tsv(cli_mod, "c1\t1.0500\t10\tkeep\ta", CRASH_ROW, "c2\t0.9812\t11\tkeep\tb")
+
+    result = runner.invoke(cli_mod.app, ["status"])
+    assert result.exit_code == 0
+    best = emit_records[-1]["best"]
+    assert best["best_val_bpb"] == 0.9812, "a crash outranked every real run"
+    assert best["best_commit"] == "c2"
+
+
+def test_status_all_crash_reports_no_best(cli_mod, emit_records):
+    """Nothing measured must read as nothing measured, not as a perfect score."""
+    _seed_tsv(cli_mod, CRASH_ROW, NO_LOG_ROW)
+
+    result = runner.invoke(cli_mod.app, ["status"])
+    assert result.exit_code == 0
+    assert emit_records[-1]["best"] == {}
+
+
 # --- sync actually writes the MRR record (no longer a stub) ----------------
 
 def test_sync_appends_mrr_record(cli_mod, emit_records):

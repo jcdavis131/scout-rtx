@@ -85,7 +85,12 @@ def status():
                     if len(parts) >= 2:
                         try:
                             bpb = float(parts[1])
-                            if best is None or bpb < best[1]:
+                            # A crashed run is logged with val_bpb 0
+                            # (run-autonomous.ps1) and lower bpb is better, so an
+                            # unfiltered minimum reports a night of crashes as the
+                            # best result. Same >0 guard as `results --best` and
+                            # `sync` already apply to results.jsonl.
+                            if bpb > 0 and (best is None or bpb < best[1]):
                                 best = (parts[0], bpb, line)
                         except Exception:
                             continue
