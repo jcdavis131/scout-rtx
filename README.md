@@ -40,6 +40,8 @@ The end-to-end pipeline was verified 2026-07-15 with a demo-seeded release (`v0.
 
 A crashed experiment is recorded with `val_bpb 0` and `status=crash`. Lower bpb is better, so 0 would otherwise be the best value the column can hold — every reader of "best val_bpb" (both publish scripts, `scout rtx status`, `scout rtx results --best`, `scout rtx sync`) therefore skips non-positive values. A run of nothing but crashes reports `unknown`, not a perfect score.
 
+The offload queue (`bb-offload/queue.json`) is hand-copied to the GPU box, so it can arrive truncated. `scout rtx queue add` and `queue list` refuse to read a corrupt queue as an empty one — `add` exits non-zero without touching the file rather than overwriting the pending tasks it could not parse. `queue clear` still overwrites, since discarding is its job, but reports that it did.
+
 Dashboard server code (actions, schema, cron sync) lives in [scout-cli](https://github.com/jcdavis131/scout-cli), not in this repo. The upstream project's original README is preserved as `README.upstream.md`.
 
 Solo personal project, no connection to employer, built with public/free-tier only.

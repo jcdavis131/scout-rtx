@@ -40,13 +40,39 @@ MRR_FILE = Path.home() / "workspace" / "projects" / "first-1k-mo-passive" / "fil
 def _ensure_dirs():
     (BB_OFFLOAD / "results").mkdir(parents=True, exist_ok=True)
 
+
+class QueueUnreadable(Exception):
+    """queue.json is present but is not a task queue we can read."""
+
+
 def _load_queue():
+    """Return the parsed queue, or raise QueueUnreadable.
+
+    A present-but-corrupt queue must not read as an empty queue. The queue is
+    hand-copied between the cloud session and the GPU box (see the `next_steps`
+    this command emits), so a truncated or half-written file is a real failure
+    mode -- and returning {"tasks": []} for one turns the next `queue add` into
+    a silent overwrite of every pending task.
+    """
     if not QUEUE_FILE.exists():
         return {"tasks": []}
     try:
-        return json.loads(QUEUE_FILE.read_text())
-    except Exception:
-        return {"tasks": []}
+        raw = QUEUE_FILE.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise QueueUnreadable(f"cannot read {QUEUE_FILE}: {exc}") from exc
+    try:
+        queue = json.loads(raw)
+    except ValueError as exc:
+        raise QueueUnreadable(f"{QUEUE_FILE} is not valid JSON: {exc}") from exc
+    if not isinstance(queue, dict) or not isinstance(queue.get("tasks"), list):
+        raise QueueUnreadable(
+            f'{QUEUE_FILE} is valid JSON but not a task queue: expected an object with a "tasks" list'
+        )
+    return queue
+
+
+QUEUE_FIX_HINT = "repair the file by hand, or run `bb rtx queue clear` to reset it to an empty queue"
+
 
 def _save_queue(q):
     _ensure_dirs()
@@ -68,11 +94,18 @@ def _load_results_jsonl(n=50):
 def status():
     """Show RTX offload status — queue, results, local profile"""
     _ensure_dirs()
-    queue = _load_queue()
+    queue_error = None
+    try:
+        queue = _load_queue()
+    except QueueUnreadable as exc:
+        # Counts stay null rather than 0: an unreadable queue is not an empty one.
+        queue = None
+        queue_error = str(exc)
     results = _load_results_jsonl(10)
 
     # Try to read hardware profile from custom docs
     hw_profile = {}
+    best_error = None
     try:
         # Check if results.tsv exists for best val_bpb
         if RESULTS_TSV.exists():
@@ -92,13 +125,15 @@ def status():
                             # `sync` already apply to results.jsonl.
                             if bpb > 0 and (best is None or bpb < best[1]):
                                 best = (parts[0], bpb, line)
-                        except Exception:
+                        except ValueError:
                             continue
                 if best:
                     hw_profile["best_val_bpb"] = best[1]
                     hw_profile["best_commit"] = best[0]
-    except Exception:
-        pass
+    except (OSError, UnicodeDecodeError) as exc:
+        # An unreadable results.tsv used to leave `best` empty, which is what a
+        # box that has never run anything also reports.
+        best_error = f"could not read {RESULTS_TSV}: {exc}"
 
     payload = {
         "custom_root": str(CUSTOM_ROOT),
@@ -106,10 +141,12 @@ def status():
         "queue_file": str(QUEUE_FILE),
         "results_file": str(RESULTS_FILE),
         "results_tsv": str(RESULTS_TSV),
-        "queue_pending": len([t for t in queue.get("tasks", []) if t.get("status") == "pending"]),
-        "queue_total": len(queue.get("tasks", [])),
+        "queue_pending": None if queue is None else len([t for t in queue["tasks"] if t.get("status") == "pending"]),
+        "queue_total": None if queue is None else len(queue["tasks"]),
+        "queue_error": queue_error,
         "results_count": len(results),
         "best": hw_profile,
+        "best_error": best_error,
         "gpu_hint": "RTX 4080 16GB ada-16gb batch 32 or RTX 4090 24GB ada-24gb-plus batch 64, BF16 TF32 SDPA, torch 2.9.1 cu128, 5-min budget",
         "offload_guide": str(CUSTOM_ROOT / "docs" / "OFFLOAD_GUIDE.md"),
         "programs": [str(p) for p in (CUSTOM_ROOT / "programs").glob("*.md")] if (CUSTOM_ROOT / "programs").exists() else [],
@@ -125,7 +162,36 @@ def queue_cmd(
 ):
     """Manage offload queue — queue tasks to Alienware RTX box"""
     _ensure_dirs()
-    q = _load_queue()
+    try:
+        q = _load_queue()
+        queue_error = None
+    except QueueUnreadable as exc:
+        q = None
+        queue_error = str(exc)
+
+    if action == "clear":
+        # The escape hatch, and the only action whose intent is already "discard
+        # whatever is in there" -- so it may overwrite an unreadable file, but it
+        # says so rather than reporting a routine clear.
+        _save_queue({"tasks": []})
+        payload = {"cleared": True, "file": str(QUEUE_FILE)}
+        if queue_error:
+            payload["overwrote_unreadable"] = queue_error
+        emit(payload)
+        return
+
+    if action not in ("add", "list"):
+        emit({"error": f"unknown action {action}", "valid": ["add","list","clear"]})
+        return
+
+    if queue_error:
+        # Refuse rather than start from {"tasks": []}: `add` would write that
+        # back, dropping every pending task and reporting the add as a success.
+        emit(
+            {"error": queue_error, "queue_file": str(QUEUE_FILE), "fix": QUEUE_FIX_HINT},
+            command=f"bb rtx queue {action}",
+        )
+        raise typer.Exit(1)
 
     if action == "add":
         if not task:
@@ -141,14 +207,8 @@ def queue_cmd(
         q["tasks"].append(entry)
         _save_queue(q)
         emit({"added": entry, "queue_file": str(QUEUE_FILE), "next_steps": f"Copy queue to Alienware or run sync script, then run program {program}"})
-    elif action == "list":
-        emit({"tasks": q.get("tasks", []), "file": str(QUEUE_FILE)})
-    elif action == "clear":
-        q = {"tasks": []}
-        _save_queue(q)
-        emit({"cleared": True, "file": str(QUEUE_FILE)})
-    else:
-        emit({"error": f"unknown action {action}", "valid": ["add","list","clear"]})
+    else:  # list -- the only action left
+        emit({"tasks": q["tasks"], "file": str(QUEUE_FILE)})
 
 @app.command("results")
 def results(

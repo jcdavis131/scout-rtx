@@ -61,6 +61,119 @@ def test_queue_unknown_action(cli_mod, emit_records):
     assert emit_records[-1]["valid"] == ["add", "list", "clear"]
 
 
+# --- a corrupt queue is not an empty queue ---------------------------------
+
+# The queue is hand-copied between the cloud session and the GPU box (it is the
+# `next_steps` line `queue add` prints), so arriving truncated is a real failure
+# mode. _load_queue used to answer `{"tasks": []}` for a file it could not
+# parse, which made a corrupt queue indistinguishable from an empty one -- and
+# the next `queue add` wrote that empty queue back over the pending tasks and
+# reported the add as a success.
+
+# A truncated copy of the shape bb-offload/queue.json actually has.
+CORRUPT_QUEUE = '{"tasks": [{"id": "2026-07-15T21:23:49", "task": "tune router en'
+
+
+def _seed_corrupt_queue(cli_mod, text=CORRUPT_QUEUE):
+    cli_mod.QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cli_mod.QUEUE_FILE.write_text(text, encoding="utf-8")
+    return cli_mod.QUEUE_FILE.read_bytes()
+
+
+def test_queue_add_refuses_to_overwrite_a_corrupt_queue(cli_mod, emit_records):
+    """The one that matters: the bytes on disk must survive a refused add."""
+    before = _seed_corrupt_queue(cli_mod)
+
+    result = runner.invoke(cli_mod.app, ["queue", "add", "--task", "new work"])
+
+    assert result.exit_code == 1
+    assert cli_mod.QUEUE_FILE.read_bytes() == before, "add clobbered a queue it could not read"
+    payload = emit_records[-1]
+    assert "not valid JSON" in payload["error"]
+    assert "queue clear" in payload["fix"], "a refusal with no way out is a dead end"
+
+
+def test_queue_list_reports_a_corrupt_queue_instead_of_no_tasks(cli_mod, emit_records):
+    _seed_corrupt_queue(cli_mod)
+
+    result = runner.invoke(cli_mod.app, ["queue", "list"])
+
+    assert result.exit_code == 1
+    payload = emit_records[-1]
+    assert "error" in payload
+    assert payload.get("tasks") is None, "an unreadable queue reported as zero tasks"
+
+
+def test_queue_clear_may_overwrite_but_says_so(cli_mod, emit_records):
+    """clear is the escape hatch -- it discards by design, so it proceeds."""
+    _seed_corrupt_queue(cli_mod)
+
+    result = runner.invoke(cli_mod.app, ["queue", "clear"])
+
+    assert result.exit_code == 0
+    assert emit_records[-1]["cleared"] is True
+    assert "not valid JSON" in emit_records[-1]["overwrote_unreadable"]
+    assert json.loads(cli_mod.QUEUE_FILE.read_text()) == {"tasks": []}
+    # and the reset queue is usable again
+    assert runner.invoke(cli_mod.app, ["queue", "add", "--task", "x"]).exit_code == 0
+
+
+def test_queue_add_refuses_valid_json_of_the_wrong_shape(cli_mod, emit_records):
+    """A hand-edited `[]` used to die in an AttributeError traceback."""
+    before = _seed_corrupt_queue(cli_mod, "[]")
+
+    result = runner.invoke(cli_mod.app, ["queue", "add", "--task", "new work"])
+
+    assert result.exit_code == 1
+    assert cli_mod.QUEUE_FILE.read_bytes() == before
+    assert "not a task queue" in emit_records[-1]["error"]
+
+
+def test_status_reports_a_corrupt_queue_as_null_not_zero(cli_mod, emit_records):
+    _seed_corrupt_queue(cli_mod)
+
+    result = runner.invoke(cli_mod.app, ["status"])
+
+    assert result.exit_code == 0, "status aggregates several sources; one bad file is not fatal"
+    payload = emit_records[-1]
+    assert payload["queue_pending"] is None, "an unreadable queue counted as 0 pending"
+    assert payload["queue_total"] is None
+    assert "not valid JSON" in payload["queue_error"]
+
+
+def test_status_surfaces_an_unreadable_results_tsv(cli_mod, emit_records, monkeypatch):
+    """An unreadable results.tsv read the same as a box that never ran anything."""
+    _seed_tsv(cli_mod, "c1\t1.0500\t10\tkeep\ta")
+    real_read_text = cli_mod.Path.read_text
+
+    def explode(self, *args, **kwargs):
+        if self == cli_mod.RESULTS_TSV:
+            raise OSError("Input/output error")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(cli_mod.Path, "read_text", explode)
+
+    result = runner.invoke(cli_mod.app, ["status"])
+
+    assert result.exit_code == 0
+    payload = emit_records[-1]
+    assert payload["best"] == {}
+    assert "Input/output error" in payload["best_error"]
+
+
+def test_status_without_a_corrupt_queue_reports_no_error(cli_mod, emit_records):
+    """The error keys are always present, so absence of a problem is explicit."""
+    runner.invoke(cli_mod.app, ["queue", "add", "--task", "real work"])
+
+    result = runner.invoke(cli_mod.app, ["status"])
+
+    assert result.exit_code == 0
+    payload = emit_records[-1]
+    assert payload["queue_error"] is None
+    assert payload["best_error"] is None
+    assert payload["queue_pending"] == 1
+
+
 # --- results TSV fallback returns LAST n rows ------------------------------
 
 def test_results_tsv_fallback_returns_last_n(cli_mod, emit_records):
