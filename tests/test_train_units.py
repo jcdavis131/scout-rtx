@@ -261,6 +261,55 @@ def test_checkpoint_defaults_to_cwd(tmp_path, monkeypatch):
     assert (tmp_path / "checkpoint_pre_eval.pt").exists()
 
 
+# --- input-bound diagnostic ------------------------------------------------
+
+def classify(data=0.0, gpu_wait=0.0, wall=1.0, steps=2):
+    return train._classify_step_bound(data, gpu_wait, wall, steps)
+
+
+def test_starved_loop_reads_as_input_bound():
+    # CPU sits in the dataloader; the GPU drained the queue and never made
+    # the CPU wait.
+    result = classify(data=0.8, gpu_wait=0.05)
+    assert result["verdict"] == "input-bound"
+    assert result["data_fraction"] == pytest.approx(0.8)
+    assert result["gpu_wait_fraction"] == pytest.approx(0.05)
+    assert result["sampled_steps"] == 2
+
+
+def test_gpu_blocked_loop_reads_as_compute_bound():
+    assert classify(data=0.1, gpu_wait=0.7)["verdict"] == "compute-bound"
+
+
+@pytest.mark.parametrize(
+    "data,gpu_wait",
+    [
+        (0.6, 0.3),   # lots of dataloader time, but the CPU still waits on the GPU
+        (0.3, 0.3),   # neither side dominates
+        (0.5, 0.2),   # exactly on both thresholds -> refuses to call it
+    ],
+)
+def test_ambiguous_splits_read_as_mixed(data, gpu_wait):
+    assert classify(data=data, gpu_wait=gpu_wait)["verdict"] == "mixed"
+
+
+def test_no_sampled_steps_returns_none():
+    # A 1-step run samples nothing, because step 0 is always excluded.
+    assert classify(data=0.8, gpu_wait=0.05, steps=0) is None
+
+
+def test_zero_wall_time_returns_none():
+    assert classify(data=0.0, gpu_wait=0.0, wall=0.0) is None
+
+
+def test_fractions_are_relative_to_sampled_wall_time():
+    result = classify(data=1.0, gpu_wait=0.1, wall=4.0, steps=3)
+    assert result["data_fraction"] == pytest.approx(0.25)
+    assert result["gpu_wait_fraction"] == pytest.approx(0.025)
+    assert result["sampled_steps"] == 3
+    assert result["verdict"] == "mixed"
+
+
 # --- misc runtime plumbing -------------------------------------------------
 
 def test_runtime_config_has_no_use_compile_field():
