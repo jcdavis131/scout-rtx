@@ -8,8 +8,11 @@ hour later as a container that died in the install step, or worse, as a run that
 looked healthy while writing into a directory it was supposed to be locked out
 of.
 
-These tests hold the config to the source. They are string-and-AST checks on
-files, so they need neither a GPU nor the packages the container installs.
+These tests hold the config to the source -- both halves of it. The executable
+keys are checked against the entrypoints they launch, and the `$`-prefixed prose
+keys, which are most of the file and all of its explanation, are checked against
+the files and functions they cite. They are string-and-AST checks on files, so
+they need neither a GPU nor the packages the container installs.
 """
 
 import ast
@@ -23,7 +26,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / "herdmux.train.json"
 
-# Keys the herdmux runner understands (docker/herdmux.train.example.json).
+# Keys the herdmux runner understands. The runner lives outside this repo, so
+# this list is stated here rather than cited -- a stranger can check it against
+# the config in front of them, which a path they cannot open does not allow.
 # Anything else is either a `$`-prefixed prose comment or a typo -- and a typo
 # is silently ignored by the runner, which is the dangerous case.
 SCHEMA_KEYS = {"command", "image", "readOnly", "timeoutMs", "shmSize", "memory", "env"}
@@ -33,8 +38,15 @@ IMAGE_PROVIDED = {"torch"}
 
 SIZE_UNITS = {"k": 1 / (1024 * 1024), "m": 1 / 1024, "g": 1.0}
 
-# docs/HARDWARE_PROFILE.md: the Docker VM has ~7.75 GB of RAM total.
+# docs/HARDWARE_PROFILE.md, "The herdmux container lane": the Docker VM has
+# ~7.75 GB of RAM total, shared by every container on the host.
 VM_MEMORY_GB = 7.75
+
+# The three labels the config's `$readThis` prose exists to point a reader at:
+# the run's whole purpose is to answer "is the loop input-bound?". If train.py
+# stops printing one, the config is still valid JSON and the lane still passes
+# green -- the run just quietly stops answering the question it was written for.
+HEADLINE_LABELS = ("dataloader_percent", "gpu_wait_percent", "loop_bound")
 
 
 # utf-8-sig, not utf-8, wherever the text is handed to a parser: a BOM survives
@@ -94,6 +106,27 @@ def _third_party(roots):
     """Drop the stdlib and this repo's own root-level modules."""
     local = {p.stem for p in REPO_ROOT.glob("*.py")}
     return {r for r in roots if r not in sys.stdlib_module_names and r not in local}
+
+
+def _prose(config):
+    """Every `$`-prefixed prose value in the config, joined into one string.
+
+    The `$` keys carry the reasoning behind every real key -- why torch is not
+    installed, why /out, what a passing run looks like. They are most of the
+    file's value to a stranger and none of it is executable, so they are the
+    part most able to go quietly stale.
+    """
+    return " ".join(v for k, v in config.items() if k.startswith("$") and isinstance(v, str))
+
+
+def _defined_names(path):
+    """Top-level function and class names defined in `path`."""
+    tree = ast.parse(path.read_text(encoding=PARSE_ENCODING))
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
 
 
 def _parse_size_gb(value):
@@ -216,6 +249,55 @@ def test_committed_state_directories_are_read_only(config):
     # bb-offload holds committed queue state and programs/ the committed
     # experiment specs. Neither is an input a trainer has any reason to write.
     assert {"bb-offload", "programs"} <= set(config["readOnly"])
+
+
+# --- the prose is held to the code too -------------------------------------
+#
+# The tests above check the executable keys. These check the `$` prose, because
+# a config that explains itself with things that are not there is worse than one
+# that does not explain itself at all: it costs a reader the time to go looking.
+
+
+def test_prose_names_only_scripts_that_exist(config):
+    named = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*\.py)\b", _prose(config)))
+    assert named, "the prose explains the command without naming a single script"
+    for name in sorted(named):
+        assert (REPO_ROOT / name).is_file(), f"prose names {name}, which is not in the repo"
+
+
+def test_prose_qualified_symbols_are_defined_where_it_says(config):
+    # `train.py:_resolve_gpu_profile` is how the prose justifies which batch
+    # sizes a passing run should print. Rename the function and the citation
+    # becomes a dead end pointing at a real file, which is the slowest kind to
+    # chase down.
+    refs = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*\.py):([A-Za-z_][A-Za-z0-9_]*)", _prose(config))
+    assert refs, "no module:symbol citation found -- has the prose stopped citing code?"
+    for module, symbol in refs:
+        path = REPO_ROOT / module
+        assert path.is_file(), f"prose cites {module}:{symbol}, but {module} is not in the repo"
+        assert symbol in _defined_names(path), f"{module} defines no {symbol}"
+
+
+def test_prose_documents_only_keys_that_are_actually_set(config):
+    # A `$shmSize` left behind after `shmSize` was dropped reads as live
+    # documentation of a setting that is no longer in effect.
+    checked = 0
+    for key in config:
+        documented = key[1:]
+        if key.startswith("$") and documented in SCHEMA_KEYS:
+            assert documented in config, f"{key} documents {documented}, which is not set"
+            checked += 1
+    assert checked, "no schema key carries prose -- the config stopped explaining itself"
+
+
+def test_the_headline_labels_are_both_promised_and_printed(config):
+    # Both halves matter. Drop the print and the run answers nothing; drop the
+    # prose and the run answers something nobody knows how to read.
+    prose = _prose(config)
+    source = (REPO_ROOT / "train.py").read_text(encoding=PARSE_ENCODING)
+    for label in HEADLINE_LABELS:
+        assert label in prose, f"the config no longer explains {label}"
+        assert f"{label}:" in source, f"train.py no longer prints a {label}: line"
 
 
 # --- container sizing ------------------------------------------------------
