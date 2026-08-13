@@ -8,12 +8,37 @@ thing. These tests are cheap and run on CPU; the lane is not.
 """
 
 import json
+import re
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / "herdmux.train.json"
+
+# The entrypoints the lane runs, in the order it runs them.
+LANE_SOURCES = ("prepare.py", "train.py")
+
+# `import a.b as c` / `from a.b import c` -> the root package pip must supply.
+IMPORT_RE = re.compile(r"^[ \t]*(?:import|from)[ \t]+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+
+# A quoted requirement inside the command string, e.g. "pyarrow>=21.0.0".
+REQUIREMENT_RE = re.compile(r'"([A-Za-z0-9_.\-]+)(>=[0-9][0-9A-Za-z.\-]*)"')
+
+
+def installed_requirements(config):
+    """{package: '>=version'} for every quoted specifier in the pip install step."""
+    return dict(REQUIREMENT_RE.findall(config["command"]))
+
+
+def third_party_imports():
+    """Root packages imported by the lane's entrypoints that pip must provide."""
+    local_modules = {path.stem for path in REPO_ROOT.glob("*.py")}
+    roots = set()
+    for name in LANE_SOURCES:
+        roots.update(IMPORT_RE.findall((REPO_ROOT / name).read_text(encoding="utf-8")))
+    return roots - sys.stdlib_module_names - local_modules
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +66,51 @@ def test_command_only_uses_flags_train_py_declares(config):
     # config's timeoutMs is not sized for.
     assert "--smoke-test" in config["command"]
     assert '"--smoke-test"' in (REPO_ROOT / "train.py").read_text(encoding="utf-8")
+
+
+def test_install_step_covers_every_import_the_entrypoints_make(config):
+    # The expensive failure this guards: an import added to train.py alone gets
+    # past the install step and past prepare.py, and only raises after the ~1 GB
+    # parquet download and the BPE tokenizer training have been paid for --
+    # an hour of GPU lane spent to reach an ImportError.
+    supplied = set(installed_requirements(config)) | {"torch"}  # torch comes from the image
+    missing = third_party_imports() - supplied
+    assert not missing, f"the lane's entrypoints import {sorted(missing)}, which pip never installs"
+
+
+def test_install_step_does_not_fight_the_image_over_torch(config):
+    # pyproject pins torch from the cu128 index; the lane runs on a cuda124
+    # image that already ships a matching build. Installing torch here would
+    # swap the image's working build for one compiled against another CUDA.
+    # Checked against the raw install step, not installed_requirements(): a
+    # bare unquoted `torch` is exactly the regression this guards, and it is
+    # invisible to a parser that only sees quoted version specifiers.
+    install_step = config["command"].split("&&")[0]
+    assert not re.search(r"\btorch\b", install_step), "the image supplies torch; do not reinstall it"
+
+
+def test_version_floors_match_pyproject(config):
+    # A bare `pip install pyarrow` is satisfied by whatever the image already
+    # ships, however old -- so the floors are what actually force prepare.py to
+    # run at or above the version this repo declares it needs.
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    requirements = installed_requirements(config)
+    assert requirements, "the install step must pin floors, not bare package names"
+    for package, floor in requirements.items():
+        assert f"{package}{floor}" in pyproject, (
+            f"the lane installs {package}{floor}, which pyproject.toml does not declare"
+        )
+
+
+def test_requirements_are_quoted_against_shell_redirection(config):
+    # The runner executes this string under `bash -lc`. An unquoted
+    # pyarrow>=21.0.0 is `pip install pyarrow` with stdout redirected into a
+    # file named `=21.0.0` -- the unbounded install the floors exist to
+    # prevent, plus junk written into the worktree, and exit code 0 either way.
+    command = config["command"]
+    for specifier in REQUIREMENT_RE.finditer(command):
+        command = command.replace(specifier.group(0), "")
+    assert ">" not in command, "version specifiers must be double-quoted inside the command"
 
 
 def test_env_vars_are_ones_the_code_actually_reads(config):
