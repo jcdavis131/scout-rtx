@@ -73,6 +73,23 @@ def test_laptop_falls_to_compatibility():
     assert profile.name == "compatibility"
 
 
+def test_lane_machine_keeps_batch_16_and_checkpointing_off_windows():
+    # The GPU lane's actual box: RTX 4080 Laptop, 12282 MiB, in a Linux
+    # container -- so is_windows is False and
+    # `default_checkpointing = is_windows or gpu_vram_gb <= 16.0` rests entirely
+    # on the VRAM term. The test above passes the is_windows=True default and so
+    # would still pass if that term were dropped, which on this box is the
+    # difference between checkpointing on and a 12 GB card trying to train
+    # without it. docs/HARDWARE_PROFILE.md quotes both values.
+    profile = resolve(name="NVIDIA GeForce RTX 4080 Laptop GPU", vram=11.99, is_windows=False)
+    assert profile.name == "compatibility"
+    assert profile.default_checkpointing is True
+    assert profile.checkpoint_modes == (True,)
+    # train_batch_candidates is (DEVICE_BATCH_SIZE, 16, 8, 4) = (16, 16, 8, 4);
+    # the candidates the lane really tries are what survives dedupe.
+    assert train._filter_train_batch_sizes(profile.train_batch_candidates) == [16, 8, 4]
+
+
 def test_below_vram_floor_falls_to_compatibility():
     profile = resolve(name="RTX 3080", cc=(8, 6), vram=8.0)  # ampere floor is 10GB
     assert profile.name == "compatibility"

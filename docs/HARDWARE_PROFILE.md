@@ -1,5 +1,50 @@
 # Hardware Profile — Davis Alienware RTX 4080/4090
 
+## The machine the GPU lane measures (read before trusting any number below)
+
+The desktop 4080/4090 material in this file predates the GPU lane and describes other
+hardware. The box `herdmux.train.json` actually runs on is an **RTX 4080 Laptop with
+12282 MiB (11.99 GiB) of VRAM**, in a Linux container. That is a different die on a
+different code path, and it changes three of this document's headline numbers.
+
+**Profile is `compatibility`, not `ada-16gb`.** `_resolve_gpu_profile` clears
+`supported_consumer` for any device whose name contains `laptop`, whatever its capability
+or VRAM, so the card falls through to the `compatibility` profile and `detect_runtime`
+prints `Warning: laptop GPUs are outside the supported desktop matrix; running
+compatibility runtime path.` That warning is the expected output of a healthy run here,
+not a fault to chase.
+
+**The knobs come out the same anyway; only autotune is lost.** `compatibility` carries
+`train_batch_candidates=(DEVICE_BATCH_SIZE, 16, 8, 4)`, which `_filter_train_batch_sizes`
+dedupes to **16, 8, 4** (`DEVICE_BATCH_SIZE` is 16), and
+`default_checkpointing = is_windows or gpu_vram_gb <= 16.0`, which is true here on VRAM
+alone — so **activation checkpointing is on**. A *supported* card of this size would land
+in the `ada-10-15gb` tier (11.99 < 15.5), which carries the same `(16, 8, 4)` and the same
+checkpointing. So the laptop exclusion costs exactly one thing: autotune.
+`_autotune_train_candidate` returns immediately when `is_supported_consumer` is false, so
+the candidates are tried in fixed order rather than measured. That also makes this section
+robust to the one detail nobody has confirmed on hardware — whether this driver spells the
+name with `Laptop` in it. Either way the batch and checkpoint knobs are identical; only
+whether autotune runs depends on it. Both numbers in this paragraph are pinned by
+`test_lane_machine_keeps_batch_16_and_checkpointing_off_windows` in
+`tests/test_train_units.py`, which resolves the profile with `is_windows=False` — as the
+container does — so the VRAM term cannot be dropped without a test going red.
+
+**`mfu_percent` is understated here by an unknown amount.** `_get_gpu_peak_flops` matches
+on substrings and has no laptop entry, so a `4080 Laptop` hits the `("4080", 242.5e12)`
+row and MFU is divided by the *desktop* 4080's peak. The laptop part is a smaller die
+under a lower power limit, so its true peak is lower and every `mfu_percent` printed on
+this box is therefore too low. The direction is certain; the size of the gap is not
+measured anywhere, so read MFU here as a within-box trend only — not as a figure
+comparable to the desktop numbers below, or to anyone else's.
+
+**A `--smoke-test` run prints `training_seconds: 0.0` and `mfu_percent: n/a`.** Both are
+correct rather than broken: `--smoke-test` stops at `max_steps = 3`, training time only
+accumulates from `step > 10`, and `steady_state_steps = max(step - 10, 0)` is then 0,
+which is the `steady_state_mfu is None` branch. `val_bpb` is real but is an untrained
+model's noise. The numbers worth reading off a smoke run are the four loop-diagnostic
+lines documented further down.
+
 ## Detected from memory
 
 - Machine: Alienware Windows box, Chrome Windows device_id 3de351a2-90b6-47e6-8c6f-755be480367c online at 2026-07-15T00:54:38Z, plus Android
@@ -29,14 +74,19 @@ Tier boundaries apply a ~0.5 GB tolerance (`VRAM_TIER_TOLERANCE_GB`) because rea
 under-report total VRAM (a 16 GB card shows ~15.99 GB); so >=15.5 GB lands in the 16GB
 tier and >=23.5 GB in the 24GB+ tier.
 
-Your RTX 4080 16GB → `ada-16gb` profile: batch candidates 32,16,8,4, checkpoint modes (False,True), default False, eval cap 16. Autotune will pick 32 usually, maybe 16 if using checkpoint.
-Your RTX 4090 24GB → `ada-24gb-plus`: batch 64,32,16,8,4, checkpoint False, eval cap 16, autotune picks 64.
+A **desktop** RTX 4080 16GB → `ada-16gb` profile: batch candidates 32,16,8,4, checkpoint modes (False,True), default False, eval cap 16. Autotune will pick 32 usually, maybe 16 if using checkpoint.
+A **desktop** RTX 4090 24GB → `ada-24gb-plus`: batch 64,32,16,8,4, checkpoint False, eval cap 16, autotune picks 64.
+
+Neither is the lane machine. A laptop part never reaches this table at all — see the
+top section for what the 4080 Laptop resolves to.
 
 ## Custom tuning for Davis
 
-We keep upstream profile logic but pre-document optimal candidates for your box:
+We keep upstream profile logic but pre-document optimal candidates for your box. Both
+subsections below are the **desktop** parts; the lane machine is the laptop 4080 covered
+at the top of this file, and none of these batch sizes or MFU figures apply to it.
 
-### RTX 4080 16GB (Ada, 9728 cores, 16GB GDDR6X, 320W)
+### Desktop RTX 4080 16GB (Ada, 9728 cores, 16GB GDDR6X, 320W)
 
 - Peak FLOPS used for MFU: `_get_gpu_peak_flops` in train.py returns 242.5e12 (242.5 TFLOPS)
   for "4080" — the dense BF16 tensor-core figure the fork's MFU math is calibrated against
@@ -50,7 +100,7 @@ We keep upstream profile logic but pre-document optimal candidates for your box:
   is left to PyTorch at runtime.
 - `PYTORCH_ALLOC_CONF=expandable_segments:True` mitigates fragmentation on Windows.
 
-### RTX 4090 24GB (Ada, 16384 cores, 24GB GDDR6X, 450W, peak BF16 ~330 TFLOPS)
+### Desktop RTX 4090 24GB (Ada, 16384 cores, 24GB GDDR6X, 450W, peak BF16 ~330 TFLOPS)
 
 - Recommended batch: 64 without checkpoint, eval batch cap 16
 - Can handle 64+32+16+8+4 candidates
@@ -189,7 +239,8 @@ Caveats, so nobody over-reads it:
 
 Because time budget fixed 5-min, batch size directly trades tokens vs steps. Larger batch → more tokens per step but fewer steps. Autotune probes candidates and picks max tokens without OOM.
 
-For your 4080/4090, you will see after smoke test:
+On the desktop parts, a **full** run — no `--smoke-test`, so the whole `TIME_BUDGET` — ends
+somewhere around:
 
 ```
 val_bpb: 0.99...
@@ -198,6 +249,13 @@ mfu_percent: 30-45%
 total_tokens_M: 300-500M
 num_steps: 500-1000
 ```
+
+These are not smoke-test numbers and they are not the lane machine's. `--smoke-test` caps
+at `max_steps = 3`, so it reports `num_steps: 3` and `total_tokens_M: 1.6`
+(`3 × TOTAL_BATCH_SIZE`), with `training_seconds: 0.0` and `mfu_percent: n/a` for the
+reasons given at the top of this file. A smoke run exists to prove the lane runs and to
+answer the input-bound question; it is not a throughput measurement, and comparing its
+output to the block above is comparing two different runs.
 
 Lower val_bpb is better, vocab-independent.
 
