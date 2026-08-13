@@ -9,6 +9,22 @@
 - Ollama: Ollama+Docker on personal machine, qwen3:32b ~20GB Q4, deepseek-r1:32b, llama3.3:70b ~40GB optional, glm4:9b-chat
 - Ollama install Windows PowerShell: winget, ollama serve, ollama pull qwen3:32b deepseek-r1:32b glm4:9b-chat
 
+## The herdmux container lane
+
+`herdmux.train.json` opts this repo into a GPU lane that runs the trainer inside a container
+on the box above. The container does not get the whole machine:
+
+- GPU: one RTX 4080 **Laptop** GPU, 12282 MiB VRAM. Not the 16 GB desktop part described below
+  — `_resolve_gpu_profile` tests `"laptop" in name` and so falls through the whole desktop matrix
+  to the `compatibility` profile: candidates `(DEVICE_BATCH_SIZE, 16, 8, 4)`, and checkpointing on
+  because `gpu_vram_gb <= 16.0`. A run printing `train_batch_size: 16` with checkpointing enabled
+  is that path working, not a misdetection.
+- Docker VM: **~7.75 GB of RAM** and 24 CPUs, shared by every container on the host.
+
+That 7.75 GB is the ceiling `shmSize` + `memory` in `herdmux.train.json` must stay under; over-commit
+and the container is OOM-killed mid-run, which reads as a training failure rather than a sizing
+mistake. `tests/test_gpu_lane_contract.py` holds the config to it.
+
 ## Upstream GPU profile logic (from train.py)
 
 In `train.py` _resolve_gpu_profile:
