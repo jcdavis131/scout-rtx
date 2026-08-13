@@ -62,6 +62,87 @@ We keep upstream profile logic but pre-document optimal candidates for your box:
 - No torch.compile (disabled in this fork runtime path) to keep stability on Windows consumer GPUs. Original upstream had FA3/fast path on H100 but removed for Windows.
 - Autotune: short eager-mode pass with 2 warmup + 3 measure steps, 90% memory fraction, caches per GPU fingerprint to `%LOCALAPPDATA%\autoresearch\gpu-profile-v2.json`. Use `AUTORESEARCH_DISABLE_AUTOTUNE=1` to skip, `AUTORESEARCH_AUTOTUNE_REFRESH=1` to refresh.
 - Windows-specific: LOCALAPPDATA cache, not .cache.
+- Run artifacts: `checkpoint_pre_eval.pt` is written to `AUTORESEARCH_OUT_DIR` when set, otherwise
+  to the working directory (unchanged default). Containerized runs set it to a mounted output
+  directory so a measuring run never leaves a checkpoint inside the checked-out repo — see
+  `herdmux.train.json`.
+
+## Is the loop input-bound? (read this before tuning anything GPU-side)
+
+Batch size, checkpointing and MFU are all GPU-side knobs. They are worth nothing if the
+GPU is idle waiting for the CPU to hand it a batch. Settle that first.
+
+### Why the dataloader is the suspect
+
+`make_dataloader` in `prepare.py` is a single-process Python generator with no worker
+processes and no prefetch, and `train.py` calls `next(train_loader)` *inline* inside the
+gradient-accumulation loop — so every microsecond it spends sits on the critical path.
+Per optimizer step at `device_batch_size=16` that is `TOTAL_BATCH_SIZE // (16 * 2048) = 16`
+batches, each packing `B` rows of `MAX_SEQ_LEN + 1 = 2049` tokens. Packing is best-fit:
+for **each document placed into a row** it linearly scans `doc_buffer`, which `refill_buffer`
+keeps topped up to `buffer_size=1000`. So the Python-level work per row is roughly
+`(2049 / mean_doc_tokens) * 1000` iterations, and TinyStories documents are short relative
+to a 2049-token row. Refills also run the BPE encoder over 128 documents at a time.
+
+That is a strong prior, not a measurement — hence the instrument below.
+
+### The instrument
+
+`train.py` prints three lines in its final summary:
+
+```
+dataloader_percent: <share of step wall-clock building batches in next(train_loader)>
+gpu_wait_percent:   <share spent blocked on the GPU>
+loop_bound:         input-bound | compute-bound | mixed
+```
+
+`gpu_wait_percent` covers the three points where the CPU actually blocks on the device: the
+`train_loss.item()` read, the trailing `torch.cuda.synchronize()`, and the dataloader's wait
+for its previous host-to-device copy to land. The first two already existed in the loop.
+The third is inside `make_dataloader` and is there for correctness, not measurement — see
+*The pinned-buffer wait* below — but it is timed and charged to `gpu_wait_percent` rather
+than to `dataloader_percent`, because a device wait counted as batch-building time is
+exactly how a compute-bound loop would misreport as input-bound.
+
+Timing only the trailing synchronize would have been wrong: `.item()` drains most of the
+queue first, so on a compute-bound run the GPU wait would have vanished into unattributed
+step time.
+
+### The pinned-buffer wait
+
+`make_dataloader` stages each batch in one pinned CPU buffer and enqueues the copy to the
+GPU with `non_blocking=True`. That copy reads the buffer when the stream reaches it, not
+when `copy_` returns. `train.py` queues `grad_accum_steps` microbatches between
+synchronization points, so the host can run far enough ahead to overwrite the buffer while
+the previous copy is still in flight — handing the GPU *this* batch's tokens for the
+*previous* batch, with correct shapes and a loss that still falls. The loader now waits on
+a CUDA event before reusing the buffer.
+
+The hazard is latent in the input-bound regime (the GPU keeps up, so there is nothing in
+flight to clobber) and fires when compute-bound. It never affected `val_bpb`: `evaluate_bpb`
+calls `.item()` every iteration, which blocks past each copy before the next one is staged.
+Autotune (`_benchmark_train_candidate`) has the same run-ahead as training, but it reports
+`tok_per_sec` and peak memory — batch *content* does not change what that costs, so its
+numbers were valid either way.
+
+Reading it (`_classify_step_bound` in `train.py`):
+
+- **input-bound** — `dataloader_percent >= 50` and `gpu_wait_percent < 20`. The GPU empties
+  the queue faster than the CPU refills it. Fix the input pipeline; ignore GPU knobs.
+- **compute-bound** — `gpu_wait_percent >= 50`. GPU-side tuning is now worth doing.
+- **mixed** — neither dominates; the thresholds deliberately refuse to guess.
+
+Caveats, so nobody over-reads it:
+
+- **Step 0 is excluded**, so a `--smoke-test` run samples only 2 steps. It pays one-time
+  CUDA context init, allocator warmup and first-kernel dispatch — cost that inflates its
+  wall time without inflating its dataloader time, which would bias `data_fraction` *down*
+  and hand back a false "not input-bound". Note the dataloader's fill-from-empty is *not*
+  what step 0 pays: `make_dataloader` is a generator, so its first buffer fill (to
+  `buffer_size=1000`, BPE encoding included) runs on the pre-loop `next(train_loader)`,
+  before any timing starts. Step 0's `next()` calls pay only steady-state refill.
+- **Time inside `next()` overlaps GPU kernels queued earlier**, so the dataloader share
+  alone cannot prove starvation — which is exactly why the verdict needs *both* numbers.
 
 ## How autoresearch finds best model for your platform
 

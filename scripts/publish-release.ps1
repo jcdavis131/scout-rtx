@@ -11,6 +11,20 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
+$Repo = "jcdavis131/scout-rtx"
+
+# Windows PowerShell 5.1 wraps a native command's stderr in a NativeCommandError
+# whenever that stream is redirected, and "Stop" makes it terminating. Both callers
+# below treat a nonzero exit as a normal answer (a tag that does not exist yet; a
+# checkout that is not a git repo) and want to branch on it, so relax the preference
+# for the call (it is function-scoped, so the caller's "Stop" is untouched) and
+# hand back the exit code instead of dying on the way to the fallback.
+function Invoke-Quiet {
+  param([string]$Exe, [string[]]$Arguments)
+  $ErrorActionPreference = "Continue"
+  $out = & $Exe @Arguments 2>$null
+  return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (($out -join "`n").Trim()) }
+}
 
 if (-not $Tag) {
   $date = Get-Date -Format "MMdd"
@@ -49,8 +63,8 @@ if (Test-Path "results.tsv") {
 }
 
 if (-not $Notes) {
-  $commit = git rev-parse --short HEAD 2>$null
-  if (-not $commit) { $commit = "unknown" }
+  $rev = Invoke-Quiet "git" @("rev-parse", "--short", "HEAD")
+  $commit = if ($rev.ExitCode -eq 0 -and $rev.Output) { $rev.Output } else { "unknown" }
   $Notes = "Best val_bpb $best from $Program commit $commit | Auto-published by publish-release.ps1 | See dashboard rtx-offload-dashboard"
 }
 
@@ -66,15 +80,23 @@ if ($DryRun) {
   exit 0
 }
 
-# Create release if not exists, then upload
-$exists = gh release view $Tag --json tagName 2>$null
-if (-not $?) {
+# Create release if not exists, then upload. The existence check has to ask about
+# the same repo the assets are pushed to, or it can answer for the local checkout
+# and then publish somewhere else.
+# A native command's nonzero exit does NOT trip $ErrorActionPreference = "Stop"
+# (only cmdlet errors do), so each gh call is checked explicitly. Without that, a
+# failed publish falls through to the "Done." banner below and exits 0.
+$view = Invoke-Quiet "gh" @("release", "view", $Tag, "--json", "tagName", "--repo", $Repo)
+if ($view.ExitCode -ne 0) {
   Write-Host "Creating release $Tag..." -ForegroundColor Green
-  gh release create $Tag --title "$Tag best $best" --notes $Notes $assets --repo jcdavis131/scout-rtx
+  gh release create $Tag --title "$Tag best $best" --notes $Notes $assets --repo $Repo
+  if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed (exit $LASTEXITCODE) - nothing published for $Tag"; exit 1 }
 } else {
   Write-Host "Release $Tag exists, uploading assets (clobber)..." -ForegroundColor Yellow
-  gh release upload $Tag $assets --clobber --repo jcdavis131/scout-rtx
-  gh release edit $Tag --notes $Notes --repo jcdavis131/scout-rtx
+  gh release upload $Tag $assets --clobber --repo $Repo
+  if ($LASTEXITCODE -ne 0) { Write-Error "gh release upload failed (exit $LASTEXITCODE) - $Tag not updated"; exit 1 }
+  gh release edit $Tag --notes $Notes --repo $Repo
+  if ($LASTEXITCODE -ne 0) { Write-Error "gh release edit failed (exit $LASTEXITCODE) - assets uploaded to $Tag but notes are stale"; exit 1 }
 }
 
 Write-Host "Done. Dashboard will auto-read in <60s: https://github.com/jcdavis131/scout-rtx/releases/tag/$Tag" -ForegroundColor Green

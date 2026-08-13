@@ -1,0 +1,26 @@
+{
+  "$": "Opts scout-rtx into the herdmux GPU lane. Deliberately minimal: its job is to prove the lane runs end to end on real hardware and to answer one question -- is the training loop input-bound? -- not to train a shippable model or benchmark throughput. See $readThis.",
+
+  "$command": "Matches this repo's actual entrypoints. prepare.py downloads the TinyStories parquet and trains the BPE tokenizer; train.py --smoke-test is its own short path (3 optimizer steps, then a bpb eval over 65,536 tokens). train.py has no --epochs or --out flag, so the small-run knob is --smoke-test and the artifact path is AUTORESEARCH_OUT_DIR. torch is deliberately NOT installed -- the image supplies it, and pyproject's cu128 pin would fight a cuda124 image. The four packages listed are exactly prepare.py's non-torch imports. If rustbpe has no wheel for the image's Python, this fails in the install step before any GPU work, which is a legible failure rather than a silent one.",
+  "command": "pip install -q pyarrow requests rustbpe tiktoken && python -u prepare.py && python -u train.py --smoke-test",
+
+  "$readOnly": "This repo ships no model weights, so there is nothing model-shaped to protect. bb-offload holds committed queue state and programs/ holds the committed experiment specs; neither is an input a trainer has any reason to write.",
+  "readOnly": ["bb-offload", "programs"],
+
+  "$env": "AUTORESEARCH_CACHE_DIR is prepare.py's existing knob. Pointing it at the persistent /cache mount means only the first run pays for the ~1 GB parquet download and the BPE tokenizer training -- prepare.py is idempotent and returns immediately once both exist, so run 2 onward is just the smoke train. AUTORESEARCH_OUT_DIR keeps checkpoint_pre_eval.pt out of /work: the default is the working directory, which here is the published worktree.",
+  "env": {
+    "AUTORESEARCH_CACHE_DIR": "/cache/autoresearch",
+    "AUTORESEARCH_OUT_DIR": "/out"
+  },
+
+  "$timeoutMs": "Sized for the first run (download + tokenizer training + smoke train). Later runs should finish in a small fraction of this; if they do not, that is itself the finding.",
+  "timeoutMs": 3600000,
+
+  "$shmSize": "This trainer's dataloader is a single-process Python generator with zero worker processes, so shm is not load-bearing here -- 1g is headroom, not a tuning choice. Kept with memory under the VM's ~7.75 GB.",
+  "shmSize": "1g",
+  "memory": "6g",
+
+  "$expect": "What a passing run looks like, so nobody reads a correct run as a broken one. The RTX 4080 Laptop GPU resolves to the 'compatibility' profile (train.py:_resolve_gpu_profile treats any 'laptop' name as outside the supported desktop matrix), which also means autotune is skipped and batch candidates are 16, 8, 4 with activation checkpointing on. --smoke-test stops at 3 steps, and train.py only accumulates timing after step 10, so a healthy smoke run prints training_seconds: 0.0 and mfu_percent: n/a. val_bpb is real but untrained-model noise.",
+
+  "$readThis": "The one number worth reading off this run. train.py now prints dataloader_percent, gpu_wait_percent and loop_bound, measured over the 2 smoke steps that are not step 0 (step 0 is excluded because it pays one-time CUDA context init, allocator warmup and first-kernel dispatch, which inflate its wall time without inflating its dataloader time and so bias the answer toward 'not input-bound'; the dataloader's fill-from-empty is not in the timed region at all, being paid by the first next(train_loader) before the loop starts). dataloader_percent is the share of step wall-clock spent inside next(train_loader) less that loader's own device wait, so it is batch-building time only; gpu_wait_percent is the share spent blocked on the GPU at train_loss.item(), the trailing synchronize, and the dataloader's wait for its previous host-to-device copy. The first two already existed in the loop. The third is a correctness fix, not an instrument: the loader stages batches in one pinned buffer and copies non_blocking, so a host running ahead could overwrite it mid-flight and feed the GPU the wrong batch silently. Its wait is timed and charged to gpu_wait rather than to the dataloader share, so a compute-bound run cannot read as input-bound. A high dataloader_percent with a near-zero gpu_wait_percent means loop_bound: input-bound, and no GPU-side tuning is worth proposing until the input pipeline is fixed. Two steps is a small sample and the verdict is coarse by design; it separates 'data is 5% of the step' from 'data is 85% of the step', which is the only question it is meant to answer."
+}

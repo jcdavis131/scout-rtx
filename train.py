@@ -1047,6 +1047,80 @@ def _configure_step_kernels(runtime):
     print(f"Muon compute dtype: {MUON_COMPUTE_DTYPE} ({muon_reason})")
 
 
+# Thresholds for the input-bound diagnostic below. Deliberately coarse: this is a
+# go/no-go signal for "fix the input pipeline before tuning the GPU", not a
+# throughput measurement.
+INPUT_BOUND_DATA_FRACTION = 0.5
+INPUT_BOUND_GPU_WAIT_FRACTION = 0.2
+COMPUTE_BOUND_GPU_WAIT_FRACTION = 0.5
+
+
+def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_steps):
+    """Report whether the loop is starved by CPU-side batch building.
+
+    make_dataloader is a single-process Python generator called inline in the
+    gradient-accumulation loop, so its cost lands on the critical path. Step time
+    is split into two columns to tell the two cases apart:
+
+      data_seconds      wall-clock inside next(train_loader), minus the loader's
+                        own device wait (below). Pure CPU work; previously queued
+                        GPU kernels keep running through it.
+      gpu_wait_seconds  wall-clock the CPU spends blocked on the GPU: the
+                        train_loss.item() device read, the trailing
+                        torch.cuda.synchronize(), and the loader's wait for its
+                        previous host-to-device copy to land.
+
+    Two of those three blocking points already existed in the loop. The third
+    lives inside make_dataloader and is required for correctness, not for
+    measurement -- it is what stops the host from overwriting a pinned buffer
+    whose copy is still in flight. It is timed and charged here to gpu_wait
+    rather than to data, because charging a device wait to batch-building time
+    is exactly how a compute-bound loop would misreport as input-bound.
+
+    A loop that cannot feed its GPU spends most of the step in the first and
+    almost none in the second, because the GPU drains the queue faster than the
+    CPU refills it. A compute-limited loop does the reverse. Returns None when
+    too few steps were sampled to say anything.
+    """
+    if sampled_steps <= 0 or wall_seconds <= 0:
+        return None
+    data_fraction = data_seconds / wall_seconds
+    gpu_wait_fraction = gpu_wait_seconds / wall_seconds
+    if (
+        data_fraction >= INPUT_BOUND_DATA_FRACTION
+        and gpu_wait_fraction < INPUT_BOUND_GPU_WAIT_FRACTION
+    ):
+        verdict = "input-bound"
+    elif gpu_wait_fraction >= COMPUTE_BOUND_GPU_WAIT_FRACTION:
+        verdict = "compute-bound"
+    else:
+        verdict = "mixed"
+    return {
+        "verdict": verdict,
+        "data_fraction": data_fraction,
+        "gpu_wait_fraction": gpu_wait_fraction,
+        "sampled_steps": sampled_steps,
+    }
+
+
+def _split_loader_step_time(data_seconds, loader_gpu_wait_seconds):
+    """Move the loader's device wait out of the data column.
+
+    next(train_loader) blocks once per batch until the previous host-to-device
+    copy has landed (see make_dataloader). That wall-clock is measured inside
+    next(), so it arrives here bundled into data_seconds, but it is time the host
+    spends blocked on the GPU. Leaving it in the data column would inflate
+    data_fraction and deflate gpu_wait_fraction on precisely the runs where the
+    GPU is the bottleneck -- the misdiagnosis this instrument exists to prevent.
+
+    Returns (data_seconds, gpu_wait_seconds) with the wait moved across. The wait
+    is clamped into [0, data_seconds]: it happened inside the timed region, so it
+    cannot exceed it, and float noise must not push either column negative.
+    """
+    wait = max(0.0, min(loader_gpu_wait_seconds, data_seconds))
+    return data_seconds - wait, wait
+
+
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
     t_start = time.time()
     torch.manual_seed(42)
@@ -1081,6 +1155,10 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     )
     model = _maybe_compile(model, dynamic=False)
 
+    # The loader reports the time it spends blocked on its own host-to-device
+    # copy here, so that wait can be attributed to the GPU instead of to batch
+    # building; see _split_loader_step_time.
+    loader_stats = {"gpu_wait_seconds": 0.0}
     train_loader = make_dataloader(
         tokenizer,
         device_batch_size,
@@ -1088,6 +1166,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "train",
         device=runtime.device,
         dataset=tokenizer.dataset,
+        stats=loader_stats,
     )
     x, y, epoch = next(train_loader)
     print(f"Time budget: {TIME_BUDGET}s")
@@ -1114,18 +1193,31 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     t_start_training = time.time()
     smooth_train_loss = 0.0
     total_training_time = 0.0
+    # Input-bound diagnostic accumulators; see _classify_step_bound.
+    sampled_steps = 0
+    total_data_seconds = 0.0
+    total_gpu_wait_seconds = 0.0
+    total_sampled_wall_seconds = 0.0
     step = 0
 
     while True:
         torch.cuda.synchronize()
         t0 = time.time()
+        step_data_seconds = 0.0
+        loader_wait_before = loader_stats["gpu_wait_seconds"]
         for _ in range(grad_accum_steps):
             with autocast_ctx:
                 loss = model(x, y)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
+            t_data0 = time.time()
             x, y, epoch = next(train_loader)
+            step_data_seconds += time.time() - t_data0
+        step_data_seconds, step_gpu_wait_seconds = _split_loader_step_time(
+            step_data_seconds,
+            loader_stats["gpu_wait_seconds"] - loader_wait_before,
+        )
 
         progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
         lrm = get_lr_multiplier(progress)
@@ -1139,15 +1231,34 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
+        # train_loss.item() is a device read: it blocks until the queued work up
+        # to that tensor has finished. Timing it (rather than only the trailing
+        # synchronize) is what keeps GPU wait from being charged to "unattributed"
+        # step time on a compute-bound run.
+        t_wait0 = time.time()
         train_loss_f = train_loss.item()
+        step_gpu_wait_seconds += time.time() - t_wait0
         if train_loss_f > 100:
             raise RuntimeError("FAIL: training loss exploded")
 
+        t_sync0 = time.time()
         torch.cuda.synchronize()
         t1 = time.time()
+        step_gpu_wait_seconds += t1 - t_sync0
         dt = t1 - t0
         if step > 10:
             total_training_time += dt
+        # Step 0 is excluded: it pays one-time CUDA context init, allocator
+        # warmup and first-kernel dispatch. That inflates its wall time without
+        # inflating its dataloader time, which would bias data_fraction *down* --
+        # a false "not input-bound" on the one question this measures. (The
+        # dataloader's fill-from-empty is not in here at all; it is paid by the
+        # pre-loop next(train_loader) before the timing starts.)
+        if step >= 1:
+            sampled_steps += 1
+            total_data_seconds += step_data_seconds
+            total_gpu_wait_seconds += step_gpu_wait_seconds
+            total_sampled_wall_seconds += dt
 
         ema_beta = 0.9
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -1160,9 +1271,11 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         else:
             mfu_text = "n/a"
         remaining = max(0, target_training_seconds - total_training_time)
+        data_pct_text = f"{100 * step_data_seconds / dt:.0f}%" if dt > 0 else "n/a"
         print(
             f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | data: {data_pct_text} | "
+            f"tok/sec: {tok_per_sec:,} | "
             f"mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="",
             flush=True,
@@ -1192,14 +1305,34 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "step": step,
         "t_start": t_start,
         "t_start_training": t_start_training,
+        "input_bound": _classify_step_bound(
+            total_data_seconds,
+            total_gpu_wait_seconds,
+            total_sampled_wall_seconds,
+            sampled_steps,
+        ),
     }
+
+
+def _resolve_out_dir():
+    """Directory for run artifacts.
+
+    Defaults to the working directory, which is what every existing script
+    expects. Containerized runs set AUTORESEARCH_OUT_DIR so a measuring run
+    writes its checkpoint to a mounted output directory instead of into the
+    checked-out repo.
+    """
+    return os.environ.get("AUTORESEARCH_OUT_DIR") or "."
 
 
 def _save_pre_eval_checkpoint(model):
     try:
         state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
-        torch.save(state_dict, "checkpoint_pre_eval.pt")
-        print("Saved checkpoint_pre_eval.pt")
+        out_dir = _resolve_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "checkpoint_pre_eval.pt")
+        torch.save(state_dict, path)
+        print(f"Saved {path}")
     except Exception as exc:  # pragma: no cover
         print(f"Warning: could not save pre-eval checkpoint: {exc}")
 
@@ -1346,6 +1479,18 @@ def main():
         print("mfu_percent:      n/a")
     else:
         print(f"mfu_percent:      {steady_state_mfu:.2f}")
+    input_bound = result["input_bound"]
+    if input_bound is None:
+        print("dataloader_percent: n/a")
+        print("gpu_wait_percent:   n/a")
+        print("loop_bound:         n/a (needs at least 2 steps)")
+    else:
+        print(f"dataloader_percent: {100 * input_bound['data_fraction']:.1f}")
+        print(f"gpu_wait_percent:   {100 * input_bound['gpu_wait_fraction']:.1f}")
+        print(
+            f"loop_bound:         {input_bound['verdict']} "
+            f"(over {input_bound['sampled_steps']} step(s), step 0 excluded)"
+        )
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")

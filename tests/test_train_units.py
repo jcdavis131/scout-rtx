@@ -221,6 +221,228 @@ def test_evaluate_bpb_excludes_zero_byte_tokens(monkeypatch):
     assert bpb == pytest.approx(0.5, rel=1e-6)
 
 
+# --- run artifact directory ------------------------------------------------
+
+class _StubModel:
+    def state_dict(self):
+        return {"w": torch.zeros(1)}
+
+
+def test_resolve_out_dir_defaults_to_cwd(monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_OUT_DIR", raising=False)
+    assert train._resolve_out_dir() == "."
+
+
+def test_resolve_out_dir_ignores_empty_env(monkeypatch):
+    monkeypatch.setenv("AUTORESEARCH_OUT_DIR", "")
+    assert train._resolve_out_dir() == "."
+
+
+def test_checkpoint_lands_in_out_dir_and_not_cwd(tmp_path, monkeypatch):
+    # A containerized run must not drop a checkpoint into the checked-out repo.
+    cwd = tmp_path / "work"
+    out_dir = tmp_path / "out" / "nested"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("AUTORESEARCH_OUT_DIR", str(out_dir))
+
+    train._save_pre_eval_checkpoint(_StubModel())
+
+    assert (out_dir / "checkpoint_pre_eval.pt").exists()  # created the dir too
+    assert list(cwd.iterdir()) == []
+
+
+def test_checkpoint_defaults_to_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("AUTORESEARCH_OUT_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    train._save_pre_eval_checkpoint(_StubModel())
+
+    assert (tmp_path / "checkpoint_pre_eval.pt").exists()
+
+
+# --- input-bound diagnostic ------------------------------------------------
+
+def classify(data=0.0, gpu_wait=0.0, wall=1.0, steps=2):
+    return train._classify_step_bound(data, gpu_wait, wall, steps)
+
+
+def test_starved_loop_reads_as_input_bound():
+    # CPU sits in the dataloader; the GPU drained the queue and never made
+    # the CPU wait.
+    result = classify(data=0.8, gpu_wait=0.05)
+    assert result["verdict"] == "input-bound"
+    assert result["data_fraction"] == pytest.approx(0.8)
+    assert result["gpu_wait_fraction"] == pytest.approx(0.05)
+    assert result["sampled_steps"] == 2
+
+
+def test_gpu_blocked_loop_reads_as_compute_bound():
+    assert classify(data=0.1, gpu_wait=0.7)["verdict"] == "compute-bound"
+
+
+@pytest.mark.parametrize(
+    "data,gpu_wait",
+    [
+        (0.6, 0.3),   # lots of dataloader time, but the CPU still waits on the GPU
+        (0.3, 0.3),   # neither side dominates
+        (0.5, 0.2),   # exactly on both thresholds -> refuses to call it
+    ],
+)
+def test_ambiguous_splits_read_as_mixed(data, gpu_wait):
+    assert classify(data=data, gpu_wait=gpu_wait)["verdict"] == "mixed"
+
+
+def test_no_sampled_steps_returns_none():
+    # A 1-step run samples nothing, because step 0 is always excluded.
+    assert classify(data=0.8, gpu_wait=0.05, steps=0) is None
+
+
+def test_zero_wall_time_returns_none():
+    assert classify(data=0.0, gpu_wait=0.0, wall=0.0) is None
+
+
+def test_fractions_are_relative_to_sampled_wall_time():
+    result = classify(data=1.0, gpu_wait=0.1, wall=4.0, steps=3)
+    assert result["data_fraction"] == pytest.approx(0.25)
+    assert result["gpu_wait_fraction"] == pytest.approx(0.025)
+    assert result["sampled_steps"] == 3
+    assert result["verdict"] == "mixed"
+
+
+# --- loader device-wait attribution ----------------------------------------
+
+def test_loader_wait_moves_from_data_to_gpu_wait():
+    data, gpu_wait = train._split_loader_step_time(1.0, 0.25)
+    assert data == pytest.approx(0.75)
+    assert gpu_wait == pytest.approx(0.25)
+
+
+def test_no_loader_wait_leaves_data_untouched():
+    assert train._split_loader_step_time(1.0, 0.0) == (1.0, 0.0)
+
+
+def test_float_noise_cannot_make_either_column_negative():
+    # the wait is measured inside the data region, so a tiny negative delta is
+    # noise, not a signal
+    data, gpu_wait = train._split_loader_step_time(1.0, -1e-12)
+    assert data == pytest.approx(1.0)
+    assert gpu_wait == 0.0
+
+
+def test_wait_is_clamped_to_the_time_it_was_measured_inside():
+    data, gpu_wait = train._split_loader_step_time(0.5, 0.9)
+    assert (data, gpu_wait) == (0.0, 0.5)
+
+
+def test_split_conserves_total_step_time():
+    data, gpu_wait = train._split_loader_step_time(2.0, 0.75)
+    assert data + gpu_wait == pytest.approx(2.0)
+
+
+def test_unattributed_loader_wait_would_invert_the_verdict():
+    # A compute-bound step: next() measured 0.7s wall, but 0.6s of that was the
+    # loader blocked on its own host-to-device copy, and .item() only had 0.1s
+    # of queue left to drain. Charging the copy wait to data time reads as
+    # "input-bound" -- the exact misdiagnosis _split_loader_step_time prevents.
+    raw_data, item_wait, wall = 0.7, 0.1, 1.0
+    assert classify(data=raw_data, gpu_wait=item_wait, wall=wall)["verdict"] == "input-bound"
+
+    data, loader_wait = train._split_loader_step_time(raw_data, 0.6)
+    result = classify(data=data, gpu_wait=loader_wait + item_wait, wall=wall)
+    assert result["verdict"] == "compute-bound"
+
+
+# --- dataloader CPU path ---------------------------------------------------
+
+class _FixedLengthTokenizer:
+    """Emits documents of exactly row_capacity tokens, each id used once.
+
+    Unique ascending ids make batch-content bugs visible: a duplicated or
+    half-overwritten batch shows up as a repeated or non-contiguous id run.
+    """
+
+    dataset = "tinystories"
+
+    def __init__(self, doc_len):
+        self.doc_len = doc_len
+        self.next_id = 100
+
+    def get_bos_token_id(self):
+        return 0
+
+    def encode(self, texts, prepend=None):
+        encoded = []
+        for _ in texts:
+            encoded.append([prepend] + [self.next_id + i for i in range(self.doc_len - 1)])
+            self.next_id += self.doc_len
+        return encoded
+
+
+@pytest.fixture
+def cpu_loader(monkeypatch):
+    def fake_document_batches(split, dataset=None, tokenizer_batch_size=128):
+        while True:
+            yield ["doc"] * 4, 1
+
+    monkeypatch.setattr(prepare, "_document_batches", fake_document_batches)
+
+    def build(B, T, stats=None):
+        return prepare.make_dataloader(
+            _FixedLengthTokenizer(doc_len=T + 1),
+            B,
+            T,
+            "train",
+            device="cpu",
+            dataset="tinystories",
+            buffer_size=8,
+            stats=stats,
+        )
+
+    return build
+
+
+def test_cpu_loader_packs_full_rows_and_shifts_targets(cpu_loader):
+    loader = cpu_loader(B=2, T=4)
+    inputs, targets, epoch = next(loader)
+    # inputs/targets alias one reusable buffer, so a caller comparing batches
+    # must copy -- true before this change and unchanged by it
+    inputs, targets = inputs.clone(), targets.clone()
+
+    assert inputs.shape == (2, 4)
+    assert targets.shape == (2, 4)
+    assert inputs.dtype == torch.long
+    assert epoch == 1
+    # every row starts with BOS and is one document, so targets is inputs shifted
+    assert inputs[0].tolist() == [0, 100, 101, 102]
+    assert targets[0].tolist() == [100, 101, 102, 103]
+    assert inputs[1].tolist() == [0, 105, 106, 107]
+
+
+def test_cpu_loader_yields_distinct_successive_batches(cpu_loader):
+    loader = cpu_loader(B=2, T=4)
+    first = next(loader)[0].clone()
+    second = next(loader)[0].clone()
+    assert not torch.equal(first, second)
+    # documents are consumed in order, so batch 2 continues where batch 1 stopped
+    assert second[0].tolist() == [0, 110, 111, 112]
+
+
+def test_cpu_loader_records_no_device_wait(cpu_loader):
+    # there is no host-to-device copy to wait on off the GPU, so the stats dict
+    # must stay untouched rather than accumulating a bogus zero-wait entry
+    stats = {"gpu_wait_seconds": 0.0}
+    loader = cpu_loader(B=2, T=4, stats=stats)
+    for _ in range(3):
+        next(loader)
+    assert stats == {"gpu_wait_seconds": 0.0}
+
+
+def test_loader_accepts_no_stats(cpu_loader):
+    loader = cpu_loader(B=2, T=4, stats=None)
+    assert next(loader)[0].shape == (2, 4)
+
+
 # --- misc runtime plumbing -------------------------------------------------
 
 def test_runtime_config_has_no_use_compile_field():
