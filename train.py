@@ -650,11 +650,18 @@ polar_express_coeffs = [
 
 
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
+    # The hyperparameter scalars are float32; the params and moments are usually
+    # bfloat16. In-place ops will not promote for you -- `lerp_` takes its third
+    # argument as `weight`, which is why a float32 beta against a bf16 moment
+    # raised "expected dtype c10::BFloat16 for `weight` but got dtype float".
+    # muon_step_fused already casts its scalars this way; this path did not.
+    p.mul_(1 - lr_t.to(p.dtype) * wd_t.to(p.dtype))
     # Keep moments in their own dtype (float32 for fp16 params) to avoid grad^2 underflow.
     g = grad.to(exp_avg.dtype)
-    exp_avg.lerp_(g, 1 - beta1_t)
-    exp_avg_sq.lerp_(g.square(), 1 - beta2_t)
+    exp_avg.lerp_(g, 1 - beta1_t.to(exp_avg.dtype))
+    exp_avg_sq.lerp_(g.square(), 1 - beta2_t.to(exp_avg_sq.dtype))
+    # Bias correction stays in float32: beta**step underflows fast in bf16, and
+    # these feed a division, so the precision is worth more than the cast.
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
@@ -685,7 +692,16 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    # The lerp weight must match the BUFFER's dtype, not g's. `beta2` above was
+    # cast to g.dtype, and g became MUON_COMPUTE_DTYPE (bfloat16) in the polar
+    # express loop, while second_momentum_buffer carries the PARAMETER dtype.
+    # For a float32 parameter that is a float32 input with a bfloat16 weight:
+    #   expected dtype float for `weight` but got dtype c10::BFloat16
+    # It only bites on mixed-dtype models, which is why bf16-only paths passed.
+    second_momentum_buffer.lerp_(
+        v_mean.to(dtype=second_momentum_buffer.dtype),
+        1 - beta2_t.to(second_momentum_buffer.dtype),
+    )
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -704,23 +720,53 @@ MUON_STEP_IMPL = muon_step_fused
 class MuonAdamW(torch.optim.Optimizer):
     """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
 
+    _SCALAR_NAMES = (
+        "_adamw_step_t",
+        "_adamw_lr_t",
+        "_adamw_beta1_t",
+        "_adamw_beta2_t",
+        "_adamw_eps_t",
+        "_adamw_wd_t",
+        "_muon_momentum_t",
+        "_muon_lr_t",
+        "_muon_wd_t",
+        "_muon_beta2_t",
+    )
+
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # Start on CPU. The parameters may still be on `meta` at this point --
+        # build_model() constructs under torch.device("meta") and only then calls
+        # model.to_empty(device=...) -- so the real device is not knowable here.
+        # _sync_scalar_device() moves these to wherever the parameters actually
+        # ended up, the first time a step runs.
+        self._scalar_device = torch.device("cpu")
+        for name in self._SCALAR_NAMES:
+            setattr(self, name, torch.tensor(0.0, dtype=torch.float32, device=self._scalar_device))
+
+    def _sync_scalar_device(self, device):
+        """Keep the hyperparameter scalars on the same device as the parameters.
+
+        These are passed straight into the fused AdamW/Muon kernels next to
+        params and grads. Left on CPU while the model trains on CUDA, every step
+        raised:
+
+            Expected all tensors to be on the same device, but found at least
+            two devices, cuda:0 and cpu!
+
+        Migration happens once; after that this is a cheap identity check.
+        """
+        if device is None or device.type == "meta" or device == self._scalar_device:
+            return
+        for name in self._SCALAR_NAMES:
+            setattr(self, name, getattr(self, name).to(device))
+        self._scalar_device = device
 
     def _step_adamw(self, group):
         for p in group["params"]:
             if p.grad is None:
                 continue
+            self._sync_scalar_device(p.device)
             grad = p.grad
             state = self.state[p]
             if not state:
@@ -756,6 +802,7 @@ class MuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         num_params = len(params)
         shape, device, dtype = p.shape, p.device, p.dtype
+        self._sync_scalar_device(device)
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
