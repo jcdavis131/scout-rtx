@@ -21,10 +21,17 @@ function Show-Status {
         $lines = Get-Content $resultsFile | Measure-Object -Line
         Write-Host "Results lines: $($lines.Lines)" -ForegroundColor Green
         Get-Content $resultsFile -Tail 5 | ForEach-Object { Write-Host $_ }
-        # Also show best val_bpb
+        # Also show best val_bpb — exclude crash/discard rows (val_bpb=0 or missing),
+        # which otherwise sort first and get misreported as "best" (matches the
+        # val_bpb>0 guard already used by bigbang-bridge/cli.py's rtx results/sync).
         try {
-            $best = Get-Content $resultsFile | ConvertFrom-Json | Sort-Object val_bpb | Select-Object -First 1
-            if ($best) { Write-Host "Best: val_bpb=$($best.val_bpb) commit=$($best.commit) program=$($best.program)" -ForegroundColor Cyan }
+            $valid = Get-Content $resultsFile | ConvertFrom-Json | Where-Object { $_.val_bpb -is [double] -or $_.val_bpb -is [int] } | Where-Object { $_.val_bpb -gt 0 }
+            $best = $valid | Sort-Object val_bpb | Select-Object -First 1
+            if ($best) {
+                Write-Host "Best: val_bpb=$($best.val_bpb) commit=$($best.commit) program=$($best.program)" -ForegroundColor Cyan
+            } else {
+                Write-Host "Best: no valid (non-crash) results yet" -ForegroundColor Yellow
+            }
         } catch {}
     } else {
         Write-Host "No results yet" -ForegroundColor Yellow
