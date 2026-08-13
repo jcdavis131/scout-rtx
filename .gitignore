@@ -1,1 +1,15 @@
 __pycache__/
+
+# train.py's _save_pre_eval_checkpoint writes this on every run, --smoke-test
+# included, into AUTORESEARCH_OUT_DIR -- and _resolve_out_dir defaults that to
+# the working directory. scripts/setup-win.ps1:52 runs `uv run train.py
+# --smoke-test` from the repo root and never sets the variable, so the repo's
+# own setup script lands a model checkpoint in the checkout every time. The
+# README tells a reader to point AUTORESEARCH_OUT_DIR somewhere else; this is
+# the net for the paths that don't.
+#
+# Unanchored, so it also covers a relative AUTORESEARCH_OUT_DIR under the repo.
+# Named exactly rather than `*.pt`: this repo ships no weights today, and a
+# blanket rule would silently hide the first one it does ship.
+# Pinned by tests/test_run_artifacts_ignored.py.
+checkpoint_pre_eval.pt
