@@ -88,13 +88,27 @@ That is a strong prior, not a measurement — hence the instrument below.
 
 ### The instrument
 
-`train.py` prints three lines in its final summary:
+`train.py` prints four lines in its final summary:
 
 ```
 dataloader_percent: <share of step wall-clock building batches in next(train_loader)>
 gpu_wait_percent:   <share spent blocked on the GPU>
+other_percent:      <the share the two timed columns do not account for>
 loop_bound:         input-bound | compute-bound | mixed
 ```
+
+It prints the same four lines a second time, earlier — the moment training
+returns, under a `[loop diagnostic]` header, before the checkpoint save and the
+eval. The measurement is finished at that point and nothing downstream improves
+it, but three things downstream can still end the run before the final summary:
+eval OOMs at every candidate batch size (`return 1`), `evaluate_bpb` raises a
+non-OOM error that nothing catches, or the lane's `timeoutMs` kills the process
+mid-eval. Any of those would discard the one answer the run exists to produce
+*after* having already paid for the parquet download, the tokenizer and the
+training steps — an hour of GPU lane for nothing. A passing run therefore
+reports these values twice, identically; that repetition is the point, not a
+bug. Both emit points go through `_format_input_bound_lines`, so they cannot
+drift apart.
 
 `gpu_wait_percent` covers the three points where the CPU actually blocks on the device: the
 `train_loss.item()` read, the trailing `torch.cuda.synchronize()`, and the dataloader's wait
@@ -105,8 +119,35 @@ than to `dataloader_percent`, because a device wait counted as batch-building ti
 exactly how a compute-bound loop would misreport as input-bound.
 
 Timing only the trailing synchronize would have been wrong: `.item()` drains most of the
-queue first, so on a compute-bound run the GPU wait would have vanished into unattributed
-step time.
+queue first, so on a compute-bound run the GPU wait would have vanished into the residual.
+
+### The residual (`other_percent`)
+
+The first two numbers are measured, not derived, so they do not sum to 100 and are not
+meant to. `other_percent` is the rest of the step, printed rather than left implicit
+because a reader who sees only `dataloader_percent: 35` and `gpu_wait_percent: 10` has no
+way to know whether the other 55% exists, let alone what is in it.
+
+It is not idle time. Two things live in there and this instrument cannot tell them apart:
+
+- **Kernel-enqueue CPU time.** Launching the forward, backward and optimizer kernels is
+  Python work on the critical path. `optimizer.step()` is the notable one — `MuonAdamW`
+  loops over param groups in Python, and each Muon group runs `ns_steps` Newton–Schulz
+  iterations of several small ops, so a depth-8 model enqueues a lot of little kernels per
+  step. This is CPU cost that is nobody's *wait*.
+- **Launch-queue backpressure.** The CUDA queue is finite. `train.py` enqueues
+  `grad_accum_steps` microbatches (16 at `device_batch_size=16`) between synchronization
+  points, so on a compute-bound run the host can fill the queue and block inside
+  `loss.backward()` — real GPU wait, at a point that is not instrumented.
+
+So the reading rule is: **a large residual bounds the verdict, it does not extend it.**
+`other_percent` well above `dataloader_percent` with a small `gpu_wait_percent` is the
+signature of a step whose cost is mostly outside the loader, some of it possibly hidden
+GPU wait — which is `mixed`, and must not be read as "the GPU has headroom, the dataloader
+is the problem". Only `dataloader_percent` itself, which is measured directly, supports
+that claim. Note the bias is one-directional and safe: backpressure inflates the residual,
+never `dataloader_percent`, so it can turn a real *compute-bound* run into `mixed` but
+cannot manufacture a false `input-bound`.
 
 ### The pinned-buffer wait
 

@@ -5,7 +5,7 @@ param(
     [string]$BranchPrefix = "autoresearch"
 )
 
-# Autonomous research loop for Windows — tailored for Alienware RTX 4080/4090
+# Autonomous research loop for Windows - tailored for Alienware RTX 4080/4090
 # Solo personal project, no connection to employer
 
 $ErrorActionPreference = "Continue"
@@ -54,7 +54,7 @@ while ($true) {
 
     Write-Host "`n--- Experiment #$expCount at $(Get-Date) ---" -ForegroundColor Cyan
 
-    # Agent prompt — tell Claude/Codex to do one iteration
+    # Agent prompt - tell Claude/Codex to do one iteration
     # This script is meant to be run alongside your agent (Claude Code etc) that edits train.py
     # If you're running manually without agent, it will just run baseline repeatedly
 
@@ -62,9 +62,19 @@ while ($true) {
     $logFile = "run.log"
     Write-Host "Running uv run train.py > $logFile  (5-min budget)..." -ForegroundColor Yellow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    # Clear the previous iteration's log first. The redirect below only
+    # truncates run.log once the process actually starts, so if uv cannot be
+    # launched at all the old log survives and its val_bpb is parsed as this
+    # experiment's result.
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
+    # -1 is a sentinel for "never launched": $LASTEXITCODE is only updated when
+    # a native command actually runs, so on the catch path it would otherwise
+    # still hold the exit code of the last git call above (0).
+    $exitCode = -1
     try {
         # Redirect all output, no tee to keep agent context clean
         uv run train.py > $logFile 2>&1
+        $exitCode = $LASTEXITCODE
     } catch {
         Write-Host "train.py failed to start: $_" -ForegroundColor Red
     }
@@ -102,6 +112,22 @@ while ($true) {
         }
     }
 
+    # A nonzero exit means the run did not finish, even if it printed a score
+    # before dying: train.py prints val_bpb: and then ~30 more lines before it
+    # returns 0, so a failure in that tail still leaves a plausible number in
+    # the log. Trust the exit code over the log. The score has to be zeroed and
+    # not merely relabelled, because `results --best` and `sync` select on
+    # val_bpb > 0 and never look at status -- a positive score here is enough
+    # to win best-of-run and be published as the headline number.
+    if ($exitCode -ne 0 -and $status -ne "crash") {
+        $rejected = $val_bpb
+        Write-Host "train.py exited $exitCode after reporting val_bpb=$rejected; recording as crash, not keep" -ForegroundColor Red
+        $val_bpb = 0.0
+        $peak_mb = 0.0
+        $status = "crash"
+        $desc = "exit $exitCode (rejected val_bpb=$rejected)"
+    }
+
     # Git commit hash short
     try {
         $commit = (git rev-parse --short HEAD).Trim()
@@ -113,7 +139,7 @@ while ($true) {
     # For now, just log TSV
     if (-not $desc) { $desc = "exp $expCount $Program" }
 
-    # Append to TSV — always record every measurement (repeated runs of the same
+    # Append to TSV - always record every measurement (repeated runs of the same
     # commit are distinct data points; the old commit-based dedup dropped them)
     $tsvLine = "$commit`t$val_bpb`t$mem_gb`t$status`t$desc"
     Add-Content -Path results.tsv -Value $tsvLine -Encoding utf8
@@ -153,7 +179,7 @@ while ($true) {
     if ($MaxExperiments -gt 0 -and $expCount -ge $MaxExperiments) { break }
 
     # Sleep tiny to avoid tight loop if crash (agent should edit train.py between runs)
-    # When used with Claude/Codex agent, agent loop handles editing — this script just runs.
+    # When used with Claude/Codex agent, agent loop handles editing - this script just runs.
     # For fully autonomous with agent, you actually want agent to loop, not this script.
     # This script is helper for manual loop.
 
@@ -167,17 +193,17 @@ while ($true) {
     # 4. Check result, decide keep/discard, git reset if discard
     # This PS loop is just a runner, not the agent itself.
 
-    # For this helper, we don't auto git reset — agent does.
+    # For this helper, we don't auto git reset - agent does.
 
     if ($expCount -ge 100 -and $MaxExperiments -eq 0) {
-        Write-Host "100 experiments done overnight — consider pausing to review results.tsv" -ForegroundColor Cyan
+        Write-Host "100 experiments done overnight - consider pausing to review results.tsv" -ForegroundColor Cyan
     }
 }
 
 Write-Host "`n=== Autonomous loop finished after $expCount experiments ===" -ForegroundColor Cyan
 Write-Host "Review results.tsv, then sync to Hatch via .\scripts\sync-to-hatch.ps1"
 
-# Final publish — best-of run -> GitHub release -> dashboard auto-read in 60s
+# Final publish - best-of run -> GitHub release -> dashboard auto-read in 60s
 try {
     $finalTag = "v0.6.0-" + (Split-Path $Program -Leaf).Replace("program-","").Replace(".md","") + "-" + (Get-Date -Format "MMdd")
     Write-Host "Final publish $finalTag -> scout-rtx releases..." -ForegroundColor Green

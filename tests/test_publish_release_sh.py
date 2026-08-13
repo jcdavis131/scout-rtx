@@ -221,6 +221,35 @@ def test_awk_missing_file_reports_unknown(tmp_path):
     assert _run_best(tmp_path) == "unknown"
 
 
+# run-autonomous.ps1 logs a run that produced no `val_bpb:` line as val_bpb 0,
+# status crash. Lower bpb is better, so 0 is the best value the column can hold.
+CRASH_ROW = "c9\t0\t0\tcrash\tcrash"
+NO_LOG_ROW = "c8\t0\t0\tcrash\tno log"
+
+
+def test_awk_ignores_crash_rows(tmp_path):
+    """One crash used to erase the real best: 0 became the running minimum, and
+    the END guard prints "unknown" when the minimum is 0 -- so a night with a
+    single crash published no number at all."""
+    rows = [
+        "c1\t1.0500\t10.1\tkeep\tfirst",
+        CRASH_ROW,
+        "c2\t0.9812\t11.0\tkeep\tbest",
+    ]
+    (tmp_path / "results.tsv").write_text("\n".join([HEADER] + rows) + "\n")
+    best = _run_best(tmp_path)
+    assert best != "unknown", "a crash row erased two real measurements"
+    assert float(best) == 0.9812
+
+
+def test_awk_all_crash_reports_unknown(tmp_path):
+    """Nothing measured must read as nothing measured, not as a perfect 0."""
+    (tmp_path / "results.tsv").write_text(
+        "\n".join([HEADER, CRASH_ROW, NO_LOG_ROW]) + "\n"
+    )
+    assert _run_best(tmp_path) == "unknown"
+
+
 # --- the script end to end -----------------------------------------------
 
 

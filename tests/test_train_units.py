@@ -310,6 +310,93 @@ def test_fractions_are_relative_to_sampled_wall_time():
     assert result["verdict"] == "mixed"
 
 
+# --- the residual column ---------------------------------------------------
+
+def test_three_columns_account_for_the_whole_step():
+    result = classify(data=0.3, gpu_wait=0.2)
+    assert result["other_fraction"] == pytest.approx(0.5)
+    total = result["data_fraction"] + result["gpu_wait_fraction"] + result["other_fraction"]
+    assert total == pytest.approx(1.0)
+
+
+def test_residual_is_clamped_to_zero_by_float_noise():
+    # Both columns are timed sub-intervals of the same step, so they can only
+    # exceed its wall clock by noise -- which must not print as a negative share.
+    assert classify(data=0.5, gpu_wait=0.5 + 1e-12)["other_fraction"] == 0.0
+
+
+def test_residual_does_not_move_the_verdict():
+    # Same two timed columns, different amounts of unaccounted step time: the
+    # residual is reported, never folded into either side of the threshold.
+    starved = classify(data=0.8, gpu_wait=0.05)
+    assert starved["verdict"] == "input-bound"
+    assert starved["other_fraction"] == pytest.approx(0.15)
+
+    diluted = classify(data=0.8, gpu_wait=0.05, wall=2.0)
+    assert diluted["verdict"] == "mixed"
+    assert diluted["other_fraction"] == pytest.approx(0.575)
+
+
+def test_large_residual_is_what_makes_mixed_readable():
+    # The likely shape of a first smoke run: the dataloader is busy and the CPU
+    # rarely blocks on the device, yet most of the step is in neither column.
+    # That remainder is kernel-enqueue time and possibly launch-queue
+    # backpressure -- hidden GPU wait -- so "mixed" must not be read as
+    # input-bound headroom.
+    result = classify(data=0.35, gpu_wait=0.10)
+    assert result["verdict"] == "mixed"
+    assert result["other_fraction"] > result["data_fraction"]
+
+
+# --- the diagnostic survives a failure after training ----------------------
+
+def diagnostic(**kwargs):
+    return train._format_input_bound_lines(classify(**kwargs))
+
+
+def keyed(lines):
+    return {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in lines}
+
+
+def test_lines_carry_every_column_and_the_verdict():
+    values = keyed(diagnostic(data=0.8, gpu_wait=0.05))
+    assert values["dataloader_percent"] == "80.0"
+    assert values["gpu_wait_percent"] == "5.0"
+    assert values["other_percent"] == "15.0"
+    assert values["loop_bound"] == "input-bound (over 2 step(s), step 0 excluded)"
+
+
+def test_too_few_steps_says_so_rather_than_printing_a_number():
+    # A run that sampled nothing must not render as 0.0% dataloader time --
+    # that reads as a measured "not input-bound".
+    values = keyed(train._format_input_bound_lines(None))
+    assert set(values) == {
+        "dataloader_percent",
+        "gpu_wait_percent",
+        "other_percent",
+        "loop_bound",
+    }
+    assert values["dataloader_percent"] == "n/a"
+    assert values["loop_bound"] == "n/a (needs at least 2 steps)"
+
+
+def test_both_emit_points_render_identically():
+    # main() prints these lines twice: once the moment training returns, once in
+    # the final summary. A passing run must repeat itself exactly, so a reader
+    # scraping loop_bound cannot find two disagreeing answers in one log.
+    result = classify(data=0.35, gpu_wait=0.10)
+    assert train._format_input_bound_lines(result) == train._format_input_bound_lines(result)
+
+
+def test_sampled_step_count_travels_with_the_verdict():
+    # The early emit point is the only place a timed-out run's numbers appear,
+    # so the line has to say how few steps backed them without the summary's
+    # context.
+    line = keyed(diagnostic(data=0.8, gpu_wait=0.05, wall=4.0, steps=7))["loop_bound"]
+    assert "over 7 step(s)" in line
+    assert "step 0 excluded" in line
+
+
 # --- loader device-wait attribution ----------------------------------------
 
 def test_loader_wait_moves_from_data_to_gpu_wait():

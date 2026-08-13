@@ -56,7 +56,11 @@ if (Test-Path "results.tsv") {
   foreach ($line in $lines) {
     $parts = $line -split "`t"
     if ($parts.Length -ge 2) {
-      try { $v = [double]$parts[1]; if ($v -lt $bestVal) { $bestVal = $v } } catch {}
+      # A crashed run is logged with val_bpb 0 (run-autonomous.ps1), and lower bpb
+      # is better -- so an unfiltered minimum publishes a night of crashes as the
+      # best result ever recorded. Only a positive value is a measurement; this is
+      # the same guard cli.py already applies to results.jsonl.
+      try { $v = [double]$parts[1]; if ($v -gt 0 -and $v -lt $bestVal) { $bestVal = $v } } catch {}
     }
   }
   if ($bestVal -ne 999) { $best = "$bestVal" }

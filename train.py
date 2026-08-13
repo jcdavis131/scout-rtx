@@ -1060,7 +1060,7 @@ def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_s
 
     make_dataloader is a single-process Python generator called inline in the
     gradient-accumulation loop, so its cost lands on the critical path. Step time
-    is split into two columns to tell the two cases apart:
+    is split into two timed columns plus the residual they leave:
 
       data_seconds      wall-clock inside next(train_loader), minus the loader's
                         own device wait (below). Pure CPU work; previously queued
@@ -1069,23 +1069,36 @@ def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_s
                         train_loss.item() device read, the trailing
                         torch.cuda.synchronize(), and the loader's wait for its
                         previous host-to-device copy to land.
+      other_fraction    the share of the step those two do not account for. Not
+                        idle: CPU spent enqueuing kernels (forward, backward,
+                        and Muon's per-group Python loop inside optimizer.step)
+                        plus host blocking when the CUDA launch queue fills.
+                        Those two causes are indistinguishable from here, so the
+                        residual is reported rather than folded into either
+                        side -- a large one bounds how far the verdict can be
+                        trusted, and is why the printed columns need not sum
+                        to 100.
 
-    Two of those three blocking points already existed in the loop. The third
-    lives inside make_dataloader and is required for correctness, not for
-    measurement -- it is what stops the host from overwriting a pinned buffer
-    whose copy is still in flight. It is timed and charged here to gpu_wait
-    rather than to data, because charging a device wait to batch-building time
-    is exactly how a compute-bound loop would misreport as input-bound.
+    Two of the three blocking points in that second column already existed in
+    the loop. The third lives inside make_dataloader and is required for
+    correctness, not for measurement -- it is what stops the host from
+    overwriting a pinned buffer whose copy is still in flight. It is timed and
+    charged here to gpu_wait rather than to data, because charging a device wait
+    to batch-building time is exactly how a compute-bound loop would misreport
+    as input-bound.
 
-    A loop that cannot feed its GPU spends most of the step in the first and
-    almost none in the second, because the GPU drains the queue faster than the
-    CPU refills it. A compute-limited loop does the reverse. Returns None when
-    too few steps were sampled to say anything.
+    A loop that cannot feed its GPU spends most of the step in the data column
+    and almost none in the gpu_wait column, because the GPU drains the queue
+    faster than the CPU refills it. A compute-limited loop does the reverse.
+    Returns None when too few steps were sampled to say anything.
     """
     if sampled_steps <= 0 or wall_seconds <= 0:
         return None
     data_fraction = data_seconds / wall_seconds
     gpu_wait_fraction = gpu_wait_seconds / wall_seconds
+    # Clamped at 0: both columns are timed sub-intervals of the same step, so
+    # they can only overrun the step's wall clock by float noise.
+    other_fraction = max(0.0, 1.0 - data_fraction - gpu_wait_fraction)
     if (
         data_fraction >= INPUT_BOUND_DATA_FRACTION
         and gpu_wait_fraction < INPUT_BOUND_GPU_WAIT_FRACTION
@@ -1099,6 +1112,7 @@ def _classify_step_bound(data_seconds, gpu_wait_seconds, wall_seconds, sampled_s
         "verdict": verdict,
         "data_fraction": data_fraction,
         "gpu_wait_fraction": gpu_wait_fraction,
+        "other_fraction": other_fraction,
         "sampled_steps": sampled_steps,
     }
 
@@ -1119,6 +1133,36 @@ def _split_loader_step_time(data_seconds, loader_gpu_wait_seconds):
     """
     wait = max(0.0, min(loader_gpu_wait_seconds, data_seconds))
     return data_seconds - wait, wait
+
+
+def _format_input_bound_lines(input_bound):
+    """Render the diagnostic as summary lines.
+
+    Split out from the final summary so the same four lines can be printed the
+    moment training returns, before eval. The measurement is complete at that
+    point, but everything downstream of it can still destroy the run: eval OOMs
+    at every candidate batch size and returns 1, evaluate_bpb raises a non-OOM
+    RuntimeError that nothing catches, or the lane's timeout kills the process
+    mid-eval. Each of those would throw away the one answer a GPU-lane run
+    exists to produce, after having already paid for the download, the
+    tokenizer and the training steps.
+    """
+    if input_bound is None:
+        return [
+            "dataloader_percent: n/a",
+            "gpu_wait_percent:   n/a",
+            "other_percent:      n/a",
+            "loop_bound:         n/a (needs at least 2 steps)",
+        ]
+    return [
+        f"dataloader_percent: {100 * input_bound['data_fraction']:.1f}",
+        f"gpu_wait_percent:   {100 * input_bound['gpu_wait_fraction']:.1f}",
+        f"other_percent:      {100 * input_bound['other_fraction']:.1f}",
+        (
+            f"loop_bound:         {input_bound['verdict']} "
+            f"(over {input_bound['sampled_steps']} step(s), step 0 excluded)"
+        ),
+    ]
 
 
 def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
@@ -1233,8 +1277,8 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
 
         # train_loss.item() is a device read: it blocks until the queued work up
         # to that tensor has finished. Timing it (rather than only the trailing
-        # synchronize) is what keeps GPU wait from being charged to "unattributed"
-        # step time on a compute-bound run.
+        # synchronize) is what keeps GPU wait from disappearing into the
+        # residual (other_fraction) on a compute-bound run.
         t_wait0 = time.time()
         train_loss_f = train_loss.item()
         step_gpu_wait_seconds += time.time() - t_wait0
@@ -1418,6 +1462,15 @@ def main():
         print("FAIL: training failed for all batch size candidates.")
         return 1
 
+    # Emitted here, not only in the final summary: the loop diagnostic is
+    # already complete and nothing after this point can improve it, while eval
+    # and the lane timeout can both end the run before the summary is reached.
+    # The same lines are printed again below, so a passing run repeats them
+    # with identical values -- see _format_input_bound_lines.
+    print("[loop diagnostic] training complete; printed before eval so a failure there cannot discard it")
+    for line in _format_input_bound_lines(result["input_bound"]):
+        print(line)
+
     model = result["model"]
     _save_pre_eval_checkpoint(model)
     model.eval()
@@ -1479,18 +1532,8 @@ def main():
         print("mfu_percent:      n/a")
     else:
         print(f"mfu_percent:      {steady_state_mfu:.2f}")
-    input_bound = result["input_bound"]
-    if input_bound is None:
-        print("dataloader_percent: n/a")
-        print("gpu_wait_percent:   n/a")
-        print("loop_bound:         n/a (needs at least 2 steps)")
-    else:
-        print(f"dataloader_percent: {100 * input_bound['data_fraction']:.1f}")
-        print(f"gpu_wait_percent:   {100 * input_bound['gpu_wait_fraction']:.1f}")
-        print(
-            f"loop_bound:         {input_bound['verdict']} "
-            f"(over {input_bound['sampled_steps']} step(s), step 0 excluded)"
-        )
+    for line in _format_input_bound_lines(result["input_bound"]):
+        print(line)
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
