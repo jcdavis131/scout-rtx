@@ -50,6 +50,16 @@ while ($true) {
     $desc = ""
     $val_bpb = 0.0
     $peak_mb = 0.0
+    # A real run trains to a wall-clock budget, not a step count (train.py stops
+    # on total_training_time >= TIME_BUDGET), so how much data the model saw is
+    # decided by how fast the box ran -- thermals, autotuned batch size, another
+    # process on the GPU. Two rows are only comparable when these two match, and
+    # run.log is deleted at the top of every iteration, so recording them here is
+    # the only chance to keep them. Reset alongside the others: parsed only in
+    # the success branch, a failed launch would inherit the previous
+    # experiment's step count, which is exactly the stale-log defect below.
+    $num_steps = 0
+    $training_seconds = 0.0
     $status = "crash"
 
     Write-Host "`n--- Experiment #$expCount at $(Get-Date) ---" -ForegroundColor Cyan
@@ -84,16 +94,24 @@ while ($true) {
         Write-Host "No run.log, treating as crash" -ForegroundColor Red
         $val_bpb = 0.0
         $peak_mb = 0.0
+        $num_steps = 0
+        $training_seconds = 0.0
         $status = "crash"
         $desc = "no log"
     } else {
         $valLine = Select-String -Path $logFile -Pattern "^val_bpb:" | Select-Object -Last 1
         $memLine = Select-String -Path $logFile -Pattern "^peak_vram_mb:" | Select-Object -Last 1
+        # train.py prints both of these in its final summary. They are what makes
+        # a val_bpb comparable to another val_bpb; see the reset block above.
+        $stepLine = Select-String -Path $logFile -Pattern "^num_steps:" | Select-Object -Last 1
+        $secLine = Select-String -Path $logFile -Pattern "^training_seconds:" | Select-Object -Last 1
         if (-not $valLine) {
             Write-Host "Crash detected, tail 50 lines:" -ForegroundColor Red
             Get-Content $logFile -Tail 50 | Write-Host
             $val_bpb = 0.0
             $peak_mb = 0.0
+            $num_steps = 0
+            $training_seconds = 0.0
             $status = "crash"
             $desc = "crash"
         } else {
@@ -101,7 +119,13 @@ while ($true) {
             if ($memLine) {
                 $peak_mb = [double]($memLine.Line -replace ".*peak_vram_mb:\s*","" -replace "\s.*","" ).Trim()
             } else { $peak_mb = 0 }
-            Write-Host "Result: val_bpb=$val_bpb peak_mb=$peak_mb" -ForegroundColor Green
+            if ($stepLine) {
+                $num_steps = [int]($stepLine.Line -replace ".*num_steps:\s*","" -replace "\s.*","" ).Trim()
+            } else { $num_steps = 0 }
+            if ($secLine) {
+                $training_seconds = [double]($secLine.Line -replace ".*training_seconds:\s*","" -replace "\s.*","" ).Trim()
+            } else { $training_seconds = 0.0 }
+            Write-Host "Result: val_bpb=$val_bpb peak_mb=$peak_mb num_steps=$num_steps" -ForegroundColor Green
             $status = "keep" # agent will decide keep/discard via git, this script just runs
 
             # Timeout check >10 min
@@ -124,6 +148,11 @@ while ($true) {
         Write-Host "train.py exited $exitCode after reporting val_bpb=$rejected; recording as crash, not keep" -ForegroundColor Red
         $val_bpb = 0.0
         $peak_mb = 0.0
+        # Zeroed with the rest: a partial run's step count describes a run whose
+        # score has just been rejected, and leaving it populated would make the
+        # row look like a completed measurement.
+        $num_steps = 0
+        $training_seconds = 0.0
         $status = "crash"
         $desc = "exit $exitCode (rejected val_bpb=$rejected)"
     }
@@ -147,11 +176,20 @@ while ($true) {
     # Also sync to bb-offload results for Hatch cloud pull
     $queueDir = "bb-offload/results"
     if (-not (Test-Path $queueDir)) { New-Item -ItemType Directory -Force -Path $queueDir | Out-Null }
+    # num_steps/training_seconds are added here and not to results.tsv on
+    # purpose: the TSV's five-column header is written in four places
+    # (here, setup-win.ps1, publish-release.ps1, publish-release.sh) and parsed
+    # positionally by scout-cli in another repo, so widening it is a
+    # cross-repo change. Every reader of this JSONL goes by property name
+    # (sync-to-hatch.ps1 sorts on .val_bpb; cli.py filters on val_bpb > 0),
+    # so an added key is backward-compatible.
     $jsonObj = @{
         ts = (Get-Date -Format o)
         commit = $commit
         val_bpb = $val_bpb
         memory_gb = $mem_gb
+        num_steps = $num_steps
+        training_seconds = $training_seconds
         status = $status
         program = $Program
         branch = $branch

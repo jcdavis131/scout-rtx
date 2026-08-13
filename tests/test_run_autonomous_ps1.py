@@ -76,8 +76,12 @@ SCRIPT = REPO_ROOT / "scripts" / "run-autonomous.ps1"
 
 HEADER = "commit\tval_bpb\tmemory_gb\tstatus\tdescription"
 
-# Stands in for `uv run train.py`. Emits the two lines the script greps for,
-# then exits with a caller-controlled code. Emission is gated on explicit 0/1
+# Stands in for `uv run train.py`. Emits the four summary lines the script greps
+# for, in the relative order train.py prints them (val_bpb, training_seconds,
+# peak_vram_mb, num_steps), then exits with a caller-controlled code. The step
+# count and the training time share one flag because they come from the same
+# summary block: a run that printed one printed the other.
+# Emission is gated on explicit 0/1
 # flags rather than on empty strings: an unset variable in cmd expands to its
 # own literal name (`%UV_VAL_BPB%`), which would put junk in the log instead of
 # the intended nothing. stdout only -- the script redirects with `2>&1`, and
@@ -87,7 +91,9 @@ UV_STUB = """@echo off
 if "%UV_EXIT%"=="" set UV_EXIT=0
 echo ---
 if "%UV_EMIT_VAL%"=="1" echo val_bpb:          %UV_VAL_BPB%
+if "%UV_EMIT_STEPS%"=="1" echo training_seconds: %UV_TRAIN_SEC%
 if "%UV_EMIT_MEM%"=="1" echo peak_vram_mb:     %UV_PEAK_MB%
+if "%UV_EMIT_STEPS%"=="1" echo num_steps:        %UV_NUM_STEPS%
 exit /b %UV_EXIT%
 """
 
@@ -156,8 +162,11 @@ def _run(
     uv_exit=0,
     val_bpb="0.981200",
     peak_mb="11264.0",
+    num_steps="742",
+    training_seconds="300.4",
     emit_val=True,
     emit_mem=True,
+    emit_steps=True,
     uv_missing=False,
 ):
     """Run the real loop against the stubs. Defaults to one clean experiment."""
@@ -172,8 +181,11 @@ def _run(
     env["UV_EXIT"] = str(uv_exit)
     env["UV_VAL_BPB"] = val_bpb
     env["UV_PEAK_MB"] = peak_mb
+    env["UV_NUM_STEPS"] = num_steps
+    env["UV_TRAIN_SEC"] = training_seconds
     env["UV_EMIT_VAL"] = "1" if emit_val else "0"
     env["UV_EMIT_MEM"] = "1" if emit_mem else "0"
+    env["UV_EMIT_STEPS"] = "1" if emit_steps else "0"
 
     return subprocess.run(
         [
@@ -305,8 +317,65 @@ def test_clean_run_is_logged_as_keep(tmp_path):
 
 def test_missing_val_bpb_is_a_crash(tmp_path):
     """The detection that already worked: the run emitted no score line."""
-    proc = _run(tmp_path, uv_exit=1, emit_val=False, emit_mem=False)
+    proc = _run(tmp_path, uv_exit=1, emit_val=False, emit_mem=False, emit_steps=False)
 
     (row,) = _rows(tmp_path, proc)
     assert float(row[1]) == 0.0
     assert row[3] == "crash", row
+
+
+# --- what makes two val_bpb rows comparable --------------------------------
+#
+# A real run trains to a wall-clock budget (train.py:1338 breaks on
+# `total_training_time >= TIME_BUDGET`, and `max_steps` is None off the smoke
+# path), so the number of optimizer steps -- how much data the model saw -- is
+# set by how fast the box happened to run: thermals, the autotuned batch size,
+# anything else sharing the GPU. A lower val_bpb can therefore mean a better
+# model or merely a faster machine-hour, and nothing in the recorded row told
+# the two apart. train.py prints both numbers, but run.log is deleted at the top
+# of the next iteration (line 69), so the row is the only place they survive.
+
+
+def test_clean_run_records_what_makes_its_score_comparable(tmp_path):
+    _run(tmp_path, uv_exit=0, num_steps="742", training_seconds="300.4")
+
+    (rec,) = _jsonl(tmp_path)
+    assert rec["num_steps"] == 742, (
+        "the step count is absent from the recorded result, so a reader cannot "
+        f"tell a better model from a faster machine-hour: {rec}"
+    )
+    assert rec["training_seconds"] == pytest.approx(300.4), rec
+
+
+def test_failed_launch_does_not_inherit_the_previous_step_count(tmp_path):
+    """The mirror of the stale-log defect, for the new fields.
+
+    Parsed only in the success branch and left out of the per-iteration reset,
+    these would carry the previous experiment's values into a row whose score is
+    0 -- a crash wearing a completed run's step count.
+    """
+    (tmp_path / "run.log").write_text(
+        "---\nval_bpb:          0.412300\ntraining_seconds: 299.9\n"
+        "peak_vram_mb:     9000.0\nnum_steps:        900\n"
+    )
+    proc = _run(tmp_path, uv_missing=True)
+
+    (rec,) = _jsonl(tmp_path)
+    assert rec["num_steps"] == 0, (
+        f"stale step count from a previous experiment leaked into this row: {rec}"
+    )
+    assert rec["training_seconds"] == 0.0, rec
+    assert float(_rows(tmp_path, proc)[0][1]) == 0.0
+
+
+def test_rejected_run_does_not_keep_a_completed_runs_step_count(tmp_path):
+    """train.py printed a summary and then exited nonzero: the score is zeroed,
+    and the step count describing it has to go with it."""
+    _run(tmp_path, uv_exit=1, num_steps="742", training_seconds="300.4")
+
+    (rec,) = _jsonl(tmp_path)
+    assert rec["val_bpb"] == 0.0
+    assert rec["num_steps"] == 0, (
+        f"a rejected run still looks like a completed measurement: {rec}"
+    )
+    assert rec["training_seconds"] == 0.0, rec

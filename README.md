@@ -68,6 +68,8 @@ scout rtx dashboard
 
 The end-to-end pipeline was verified 2026-07-15 with a demo-seeded release (`v0.6.0-demo-0715`). The 0.9935 val_bpb in that release is a synthetic demo value, not a real training result. Publish scripts refuse to fabricate rows: they exit if `results.tsv` is missing unless an explicit `-Demo`/`--demo` flag is passed, which tags the row `status=demo`.
 
+Training stops on a wall-clock budget rather than a step count, so how much data a run saw depends on how fast the box happened to be — a lower `val_bpb` can mean a better model or just a faster machine-hour. Each row in `bb-offload/results/results.jsonl` therefore carries `num_steps` and `training_seconds` alongside the score; two scores are comparable when those match. (`results.tsv` keeps its five columns, since scout-cli parses them positionally.)
+
 A crashed experiment is recorded with `val_bpb 0` and `status=crash`. Lower bpb is better, so 0 would otherwise be the best value the column can hold — every reader of "best val_bpb" (both publish scripts, `scout rtx status`, `scout rtx results --best`, `scout rtx sync`) therefore skips non-positive values. A run of nothing but crashes reports `unknown`, not a perfect score.
 
 The offload queue (`bb-offload/queue.json`) is hand-copied to the GPU box, so it can arrive truncated. `scout rtx queue add` and `queue list` refuse to read a corrupt queue as an empty one — `add` exits non-zero without touching the file rather than overwriting the pending tasks it could not parse. `queue clear` still overwrites, since discarding is its job, but reports that it did.
