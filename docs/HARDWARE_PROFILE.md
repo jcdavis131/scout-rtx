@@ -88,7 +88,48 @@ We keep upstream profile logic but pre-document optimal candidates for your box:
 Batch size, checkpointing and MFU are all GPU-side knobs. They are worth nothing if the
 GPU is idle waiting for the CPU to hand it a batch. Settle that first.
 
-### Why the dataloader is the suspect
+### What the lane has measured so far
+
+**It is not input-bound.** Six container runs, recorded 2026-08-13 21:11 through 22:17, all
+on the smoke path (`--smoke-test`, `train_batch_size: 16`, activation checkpointing enabled,
+2 sampled steps after step 0 is excluded):
+
+| run | `dataloader_percent` | `gpu_wait_percent` | `loop_bound` | lane result |
+|---|---|---|---|---|
+| 21:11 | 3.7 | 0.6 | mixed | pass |
+| 21:22 | 3.0 | 0.6 | mixed | pass |
+| 21:37 | 2.8 | 0.6 | mixed | pass |
+| 21:52 | 2.8 | 0.6 | mixed | pass |
+| 22:04 | 3.1 | 0.6 | mixed | **fail** — the lane recorded a failure; the numbers in this row are from its stdout, which is why it is here rather than dropped silently |
+| 22:17 | 3.9 | 0.6 | mixed | pass |
+
+This table cannot include the current cycle's run: the lane executes after the edit that
+would describe it, so it is by construction one run behind.
+
+Two tiers of claim, kept apart on purpose.
+
+**Measured.** `dataloader_percent` never left 2.8–3.9 against an `input-bound` threshold of
+50, and `gpu_wait_percent` sat at 0.6 against a `compute-bound` threshold of 50. Six runs,
+no drift, both margins an order of magnitude wide. The `mixed` verdict here does not mean
+"too close to call" — it means *neither*, decisively. The prior below is refuted for this
+configuration, and the GPU-side knobs above are no longer blocked on fixing the input
+pipeline first.
+
+**Inferred, not measured.** The two instrumented columns together account for 3–5% of step
+wall-clock. The instrument has no column for the other ~95% and therefore says nothing about
+it; it is unattributed, not explained. The leading hypothesis is host-side step body — Python
+and kernel-launch overhead in forward/backward/optimizer, which a tiny model under activation
+checkpointing pays per step regardless of how fast the GPU is. Testing that needs a third
+column, not a re-reading of these two.
+
+Scope: this is the smoke regime only — 2 steps, batch 16, checkpointing on, an untrained
+model. It does not describe a full hill-climb run, where a longer step and a warm allocator
+change the shares.
+
+### Why the dataloader was the suspect
+
+*(Kept because it is the reasoning that justified building the instrument. The measurement
+above tested it and it did not hold — read it as a hypothesis, not as a live finding.)*
 
 `make_dataloader` in `prepare.py` is a single-process Python generator with no worker
 processes and no prefetch, and `train.py` calls `next(train_loader)` *inline* inside the
